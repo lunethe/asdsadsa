@@ -108,8 +108,11 @@ class CopyleaksConfig:
     max_retries: int = 3
     # Request timeout in seconds
     timeout_seconds: float = 45.0
-    # Headless browser (False useful for debugging)
-    headless: bool = os.getenv("CL_HEADLESS", "true").lower() == "true"
+    # Path to proxy list file (one proxy per line, e.g. http://user:pass@host:port)
+    # Leave empty to use no proxy (direct IP). Get proxies from Webshare/ProxyMesh etc.
+    proxy_file: str = os.getenv("PROXY_FILE", "")
+    # Headless browser (no longer used, kept for compatibility)
+    headless: bool = True
 
 
 @dataclass

@@ -433,9 +433,9 @@ class GRPOTrainer:
                 num_workers=cfg.copyleaks.num_workers,
                 rate_limit=cfg.copyleaks.rate_limit_seconds,
                 timeout=cfg.copyleaks.timeout_seconds,
-                headless=cfg.copyleaks.headless,
                 max_retries=cfg.copyleaks.max_retries,
                 mock_mode=cfg.copyleaks.mock_mode,
+                proxy_file=cfg.copyleaks.proxy_file or None,
             ) as reward_pool:
                 await _training_loop(
                     cfg, model, tokenizer, dataloader, optimizer, scheduler,

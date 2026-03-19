@@ -55,10 +55,34 @@ def _prepare_text(text: str) -> str:
     return text
 
 
+def _load_proxies(proxy_file: str) -> list:
+    """
+    Load proxies from a text file, one per line.
+    Supported formats:
+      http://host:port
+      http://user:pass@host:port
+      host:port              (http:// prepended automatically)
+    """
+    import os
+    if not proxy_file or not os.path.exists(proxy_file):
+        return []
+    proxies = []
+    with open(proxy_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not line.startswith("http"):
+                line = f"http://{line}"
+            proxies.append(line)
+    return proxies
+
+
 class CopyleaksAPIWorker:
     """
     Scores texts by calling the Copyleaks anonymous API directly.
     Uses httpx for async HTTP — no browser, no disk, fast.
+    Each worker uses a different proxy from the pool (if provided).
     """
 
     def __init__(
@@ -67,11 +91,13 @@ class CopyleaksAPIWorker:
         rate_limit: float = 4.0,
         max_retries: int = 3,
         timeout: float = 30.0,
+        proxy: str = None,       # e.g. "http://user:pass@host:port"
     ):
         self.worker_id = worker_id
         self.rate_limit = rate_limit
         self.max_retries = max_retries
         self.timeout = timeout
+        self.proxy = proxy
         self._client = None
         self._last_request_at = 0.0
 
@@ -80,11 +106,16 @@ class CopyleaksAPIWorker:
             import httpx
         except ImportError:
             raise ImportError("Run: pip install httpx")
+
+        proxy_url = self.proxy or None
         self._client = httpx.AsyncClient(
             headers=HEADERS,
             timeout=self.timeout,
             follow_redirects=True,
+            proxy=proxy_url,
         )
+        proxy_display = self.proxy.split("@")[-1] if self.proxy else "no proxy"
+        logger.info(f"[Worker {self.worker_id}] HTTP client ready ({proxy_display})")
         logger.info(f"[Worker {self.worker_id}] HTTP client ready")
 
     async def stop(self):
@@ -145,9 +176,11 @@ class CopyleaksAPIWorker:
         response = await self._client.post(API_URL, content=payload)
 
         if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", "10"))
+            retry_after = int(response.headers.get("Retry-After", "30"))
             logger.warning(
-                f"[Worker {self.worker_id}] Rate limited, sleeping {retry_after}s"
+                f"[Worker {self.worker_id}] Rate limited "
+                f"({'proxy: ' + self.proxy.split('@')[-1] if self.proxy else 'no proxy'})"
+                f", sleeping {retry_after}s"
             )
             await asyncio.sleep(retry_after)
             raise RuntimeError("rate_limited")
@@ -224,6 +257,7 @@ class CopyleaksRewardPool:
         timeout: float = 30.0,
         max_retries: int = 3,
         mock_mode: bool = False,
+        proxy_file: str = None,   # path to proxies.txt, one proxy per line
         # Kept for API compatibility with old code, no longer used:
         headless: bool = True,
     ):
@@ -231,12 +265,17 @@ class CopyleaksRewardPool:
         if mock_mode:
             self._workers = [MockRewardWorker(i) for i in range(num_workers)]
         else:
+            proxies = _load_proxies(proxy_file) if proxy_file else []
+            if proxies:
+                logger.info(f"Loaded {len(proxies)} proxies for {num_workers} workers")
             self._workers = [
                 CopyleaksAPIWorker(
                     worker_id=i,
                     rate_limit=rate_limit,
                     timeout=timeout,
                     max_retries=max_retries,
+                    # Assign proxies round-robin; None if no proxies provided
+                    proxy=proxies[i % len(proxies)] if proxies else None,
                 )
                 for i in range(num_workers)
             ]
