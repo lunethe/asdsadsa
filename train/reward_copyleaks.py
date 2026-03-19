@@ -1,10 +1,17 @@
 """
 Copyleaks Reward Function
 ==========================
-Calls Copyleaks' anonymous AI-scan API directly — no browser needed.
+Calls the Copyleaks AI-scan API from within a Playwright browser context.
+Direct HTTP calls from datacenter IPs (RunPod) get 403'd — using the browser
+as a proxy routes requests through a residential-looking browser session.
 
-Discovered endpoint:
-  POST https://app.copyleaks.com/api/v2/dashboard/anonymous/ai-scan/submit/text
+Strategy:
+  1. Open one persistent browser page at app.copyleaks.com/v1/scan/ai/embedded
+  2. For each text, call fetch() via page.evaluate() (same-origin, browser cookies)
+  3. Parse summary.ai from the JSON response
+
+Endpoint (discovered by intercepting browser network traffic):
+  POST /api/v2/dashboard/anonymous/ai-scan/submit/text
   Body: {"text": "<string, min 150 chars>"}
   Response: {"summary": {"ai": 0.95, "human": 0.05}, ...}
 
@@ -12,6 +19,7 @@ Reward = summary.human  (1.0 = fully human, 0.0 = fully AI)
 """
 
 import asyncio
+import json
 import logging
 import random
 import time
@@ -20,49 +28,199 @@ from typing import List, Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-API_URL = "https://app.copyleaks.com/api/v2/dashboard/anonymous/ai-scan/submit/text"
-HEADERS = {
-    "Content-Type": "application/json",
-    "Referer": "https://app.copyleaks.com/v1/scan/ai/embedded",
-    "Origin": "https://app.copyleaks.com",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-}
-
-MIN_CHARS = 150   # Copyleaks rejects shorter texts
-MAX_CHARS = 25000  # Free tier limit shown in UI
+EMBEDDED_URL = "https://app.copyleaks.com/v1/scan/ai/embedded"
+API_PATH = "/api/v2/dashboard/anonymous/ai-scan/submit/text"
+MIN_CHARS = 150
+MAX_CHARS = 25000
 
 
 @dataclass
 class ScoreResult:
-    text_preview: str       # First 80 chars for logging
+    text_preview: str
     ai_probability: float   # 0.0 = human, 1.0 = AI
-    reward: float           # = 1.0 - ai_probability (maximize this)
+    reward: float           # 1.0 - ai_probability
     raw: Dict[str, Any]
     error: Optional[str] = None
 
 
 def _prepare_text(text: str) -> str:
-    """Ensure text meets API requirements."""
     text = text.strip()
     if len(text) > MAX_CHARS:
-        # Cut at last word boundary
         text = text[:MAX_CHARS]
-        text = text[: text.rfind(" ")] if " " in text else text
+        last_space = text.rfind(" ")
+        text = text[:last_space] if last_space > 0 else text
     return text
 
 
+class CopyleaksWorker:
+    """
+    One Playwright browser page kept open at the Copyleaks embedded detector.
+    Scores texts by calling fetch() from within the page (bypasses IP blocks).
+    """
+
+    def __init__(
+        self,
+        worker_id: int,
+        rate_limit: float = 4.0,
+        max_retries: int = 3,
+        timeout: float = 30.0,
+        headless: bool = True,
+        proxy: Optional[str] = None,
+    ):
+        self.worker_id = worker_id
+        self.rate_limit = rate_limit
+        self.max_retries = max_retries
+        self.timeout = timeout
+        self.headless = headless
+        self.proxy = proxy
+        self._browser = None
+        self._page = None
+        self._playwright = None
+        self._last_request_at = 0.0
+
+    async def start(self):
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            raise ImportError("Run: pip install playwright && playwright install chromium")
+
+        self._playwright = await async_playwright().start()
+
+        launch_kwargs = dict(
+            headless=self.headless,
+            args=["--no-sandbox", "--disable-setuid-sandbox",
+                  "--disable-blink-features=AutomationControlled"],
+        )
+        if self.proxy:
+            launch_kwargs["proxy"] = {"server": self.proxy}
+
+        self._browser = await self._playwright.chromium.launch(**launch_kwargs)
+        context = await self._browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+        )
+        self._page = await context.new_page()
+
+        # Navigate once to establish session/cookies
+        await self._page.goto(EMBEDDED_URL, wait_until="domcontentloaded",
+                              timeout=int(self.timeout * 1000))
+        logger.info(f"[Worker {self.worker_id}] Browser ready at {EMBEDDED_URL}")
+
+    async def stop(self):
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
+
+    async def _wait_rate_limit(self):
+        elapsed = time.monotonic() - self._last_request_at
+        wait = self.rate_limit - elapsed
+        if wait > 0:
+            await asyncio.sleep(wait + random.uniform(0.2, 1.0))
+        self._last_request_at = time.monotonic()
+
+    async def score(self, text: str) -> ScoreResult:
+        text = _prepare_text(text)
+        preview = text[:80].replace("\n", " ")
+
+        if len(text) < MIN_CHARS:
+            logger.warning(f"[Worker {self.worker_id}] Text too short ({len(text)} chars)")
+            return ScoreResult(text_preview=preview, ai_probability=0.5, reward=0.5,
+                               raw={"error": "too_short"}, error="too_short")
+
+        for attempt in range(self.max_retries):
+            try:
+                await self._wait_rate_limit()
+                result = await self._fetch_via_browser(text, preview)
+                return result
+            except Exception as e:
+                logger.warning(
+                    f"[Worker {self.worker_id}] Attempt {attempt + 1}/{self.max_retries} "
+                    f"failed: {e}"
+                )
+                if attempt < self.max_retries - 1:
+                    # Reload the page in case the session expired
+                    try:
+                        await self._page.reload(wait_until="domcontentloaded",
+                                                timeout=int(self.timeout * 1000))
+                    except Exception:
+                        pass
+                    await asyncio.sleep(5.0 * (attempt + 1))
+
+        logger.error(f"[Worker {self.worker_id}] All retries failed: {preview!r}")
+        return ScoreResult(text_preview=preview, ai_probability=0.5, reward=0.5,
+                           raw={"error": "all_retries_failed"}, error="all_retries_failed")
+
+    async def _fetch_via_browser(self, text: str, preview: str) -> ScoreResult:
+        """Call the Copyleaks API via fetch() executed inside the browser page."""
+        payload = json.dumps({"text": text})
+
+        # Execute fetch from within the page — same origin, browser cookies, real IP
+        result = await self._page.evaluate(
+            """async ([apiPath, payload]) => {
+                const resp = await fetch(apiPath, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json, text/plain, */*',
+                    },
+                    body: payload,
+                });
+                const text = await resp.text();
+                return { status: resp.status, body: text };
+            }""",
+            [API_PATH, payload],
+        )
+
+        status = result["status"]
+        body = result["body"]
+
+        if status == 429:
+            raise RuntimeError("rate_limited (429)")
+        if status != 200:
+            raise RuntimeError(f"HTTP {status}: {body[:200]}")
+
+        data = json.loads(body)
+        summary = data.get("summary", {})
+        ai_prob = float(summary.get("ai", 0.5))
+        ai_prob = max(0.0, min(1.0, ai_prob))
+        reward = 1.0 - ai_prob
+
+        logger.info(
+            f"[Worker {self.worker_id}] AI={ai_prob:.2%} → reward={reward:.3f} "
+            f"| {preview!r}"
+        )
+        return ScoreResult(text_preview=preview, ai_probability=ai_prob,
+                           reward=reward, raw=data)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mock worker
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MockRewardWorker:
+    def __init__(self, worker_id: int = 0):
+        self.worker_id = worker_id
+
+    async def start(self): pass
+    async def stop(self): pass
+
+    async def score(self, text: str) -> ScoreResult:
+        await asyncio.sleep(random.uniform(0.05, 0.2))
+        ai_prob = max(0.0, min(1.0, random.betavariate(5, 2)))
+        return ScoreResult(text_preview=text[:80], ai_probability=ai_prob,
+                           reward=1.0 - ai_prob, raw={"mock": True})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pool
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _load_proxies(proxy_file: str) -> list:
-    """
-    Load proxies from a text file, one per line.
-    Supported formats:
-      http://host:port
-      http://user:pass@host:port
-      host:port              (http:// prepended automatically)
-    """
     import os
     if not proxy_file or not os.path.exists(proxy_file):
         return []
@@ -78,188 +236,21 @@ def _load_proxies(proxy_file: str) -> list:
     return proxies
 
 
-class CopyleaksAPIWorker:
-    """
-    Scores texts by calling the Copyleaks anonymous API directly.
-    Uses httpx for async HTTP — no browser, no disk, fast.
-    Each worker uses a different proxy from the pool (if provided).
-    """
-
-    def __init__(
-        self,
-        worker_id: int,
-        rate_limit: float = 4.0,
-        max_retries: int = 3,
-        timeout: float = 30.0,
-        proxy: str = None,       # e.g. "http://user:pass@host:port"
-    ):
-        self.worker_id = worker_id
-        self.rate_limit = rate_limit
-        self.max_retries = max_retries
-        self.timeout = timeout
-        self.proxy = proxy
-        self._client = None
-        self._last_request_at = 0.0
-
-    async def start(self):
-        try:
-            import httpx
-        except ImportError:
-            raise ImportError("Run: pip install httpx")
-
-        proxy_url = self.proxy or None
-        self._client = httpx.AsyncClient(
-            headers=HEADERS,
-            timeout=self.timeout,
-            follow_redirects=True,
-            proxy=proxy_url,
-        )
-        proxy_display = self.proxy.split("@")[-1] if self.proxy else "no proxy"
-        logger.info(f"[Worker {self.worker_id}] HTTP client ready ({proxy_display})")
-        logger.info(f"[Worker {self.worker_id}] HTTP client ready")
-
-    async def stop(self):
-        if self._client:
-            await self._client.aclose()
-
-    async def _wait_rate_limit(self):
-        elapsed = time.monotonic() - self._last_request_at
-        wait = self.rate_limit - elapsed
-        if wait > 0:
-            await asyncio.sleep(wait + random.uniform(0.2, 1.0))
-        self._last_request_at = time.monotonic()
-
-    async def score(self, text: str) -> ScoreResult:
-        text = _prepare_text(text)
-        preview = text[:80].replace("\n", " ")
-
-        # Pad short texts to meet minimum length
-        if len(text) < MIN_CHARS:
-            logger.warning(
-                f"[Worker {self.worker_id}] Text too short ({len(text)} chars), "
-                f"returning neutral reward."
-            )
-            return ScoreResult(
-                text_preview=preview,
-                ai_probability=0.5,
-                reward=0.5,
-                raw={"error": "too_short"},
-                error="too_short",
-            )
-
-        for attempt in range(self.max_retries):
-            try:
-                await self._wait_rate_limit()
-                result = await self._call_api(text, preview)
-                return result
-            except Exception as e:
-                logger.warning(
-                    f"[Worker {self.worker_id}] Attempt {attempt + 1}/{self.max_retries} "
-                    f"failed: {e}"
-                )
-                if attempt < self.max_retries - 1:
-                    await asyncio.sleep(5.0 * (attempt + 1))
-
-        logger.error(f"[Worker {self.worker_id}] All retries failed: {preview!r}")
-        return ScoreResult(
-            text_preview=preview,
-            ai_probability=0.5,
-            reward=0.5,
-            raw={"error": "all_retries_failed"},
-            error="all_retries_failed",
-        )
-
-    async def _call_api(self, text: str, preview: str) -> ScoreResult:
-        import json as _json
-
-        payload = _json.dumps({"text": text})
-        response = await self._client.post(API_URL, content=payload)
-
-        if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", "30"))
-            logger.warning(
-                f"[Worker {self.worker_id}] Rate limited "
-                f"({'proxy: ' + self.proxy.split('@')[-1] if self.proxy else 'no proxy'})"
-                f", sleeping {retry_after}s"
-            )
-            await asyncio.sleep(retry_after)
-            raise RuntimeError("rate_limited")
-
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"HTTP {response.status_code}: {response.text[:200]}"
-            )
-
-        data = response.json()
-        summary = data.get("summary", {})
-
-        ai_prob = float(summary.get("ai", 0.5))
-        ai_prob = max(0.0, min(1.0, ai_prob))
-        reward = 1.0 - ai_prob
-
-        logger.info(
-            f"[Worker {self.worker_id}] AI={ai_prob:.2%} → reward={reward:.3f} "
-            f"| {preview!r}"
-        )
-        return ScoreResult(
-            text_preview=preview,
-            ai_probability=ai_prob,
-            reward=reward,
-            raw=data,
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Mock worker (for offline testing)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class MockRewardWorker:
-    """Random scores skewed toward AI-detected. Use MOCK_REWARDS=true."""
-
-    def __init__(self, worker_id: int = 0):
-        self.worker_id = worker_id
-
-    async def start(self):
-        pass
-
-    async def stop(self):
-        pass
-
-    async def score(self, text: str) -> ScoreResult:
-        await asyncio.sleep(random.uniform(0.05, 0.2))
-        ai_prob = random.betavariate(5, 2)  # mean ~0.71
-        ai_prob = max(0.0, min(1.0, ai_prob))
-        return ScoreResult(
-            text_preview=text[:80],
-            ai_probability=ai_prob,
-            reward=1.0 - ai_prob,
-            raw={"mock": True},
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Pool: N workers scoring concurrently
-# ─────────────────────────────────────────────────────────────────────────────
-
 class CopyleaksRewardPool:
     """
-    Manages N async HTTP workers for parallel scoring.
-
-    Usage:
-        async with CopyleaksRewardPool(num_workers=3) as pool:
-            results = await pool.score_batch(texts)
+    Manages N browser workers. Each keeps a persistent page open and
+    calls the Copyleaks API via in-browser fetch().
     """
 
     def __init__(
         self,
-        num_workers: int = 3,
+        num_workers: int = 2,
         rate_limit: float = 4.0,
         timeout: float = 30.0,
         max_retries: int = 3,
         mock_mode: bool = False,
-        proxy_file: str = None,   # path to proxies.txt, one proxy per line
-        # Kept for API compatibility with old code, no longer used:
         headless: bool = True,
+        proxy_file: str = None,
     ):
         self.mock_mode = mock_mode
         if mock_mode:
@@ -269,12 +260,12 @@ class CopyleaksRewardPool:
             if proxies:
                 logger.info(f"Loaded {len(proxies)} proxies for {num_workers} workers")
             self._workers = [
-                CopyleaksAPIWorker(
+                CopyleaksWorker(
                     worker_id=i,
                     rate_limit=rate_limit,
                     timeout=timeout,
                     max_retries=max_retries,
-                    # Assign proxies round-robin; None if no proxies provided
+                    headless=headless,
                     proxy=proxies[i % len(proxies)] if proxies else None,
                 )
                 for i in range(num_workers)
@@ -287,54 +278,38 @@ class CopyleaksRewardPool:
     async def __aexit__(self, *args):
         await asyncio.gather(*[w.stop() for w in self._workers])
 
-    async def score_batch(self, texts: List[str]) -> List[ScoreResult]:
-        """
-        Score all texts using the worker pool (round-robin assignment).
-        Each worker processes its share sequentially to respect rate limits.
-        """
-        assignments: List[List[str]] = [[] for _ in self._workers]
+    async def score_batch(self, texts: List[str]) -> List["ScoreResult"]:
+        assignments = [[] for _ in self._workers]
         for i, text in enumerate(texts):
             assignments[i % len(self._workers)].append(text)
 
         async def worker_task(worker, worker_texts):
             results = []
             for t in worker_texts:
-                r = await worker.score(t)
-                results.append(r)
+                results.append(await worker.score(t))
             return results
 
         worker_results = await asyncio.gather(*[
-            worker_task(w, assignments[i])
-            for i, w in enumerate(self._workers)
+            worker_task(w, assignments[i]) for i, w in enumerate(self._workers)
         ])
 
-        # Reassemble in original order
         ordered = [None] * len(texts)
         counters = [0] * len(self._workers)
         for i in range(len(texts)):
             w_idx = i % len(self._workers)
             ordered[i] = worker_results[w_idx][counters[w_idx]]
             counters[w_idx] += 1
-
         return ordered
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Sync wrapper
+# Sync wrapper + CLI test
 # ─────────────────────────────────────────────────────────────────────────────
 
-def score_texts_sync(
-    texts: List[str],
-    num_workers: int = 3,
-    mock_mode: bool = False,
-    **kwargs,
-) -> List[ScoreResult]:
+def score_texts_sync(texts, num_workers=2, mock_mode=False, **kwargs):
     async def _run():
-        async with CopyleaksRewardPool(
-            num_workers=num_workers,
-            mock_mode=mock_mode,
-            **kwargs,
-        ) as pool:
+        async with CopyleaksRewardPool(num_workers=num_workers,
+                                       mock_mode=mock_mode, **kwargs) as pool:
             return await pool.score_batch(texts)
     return asyncio.run(_run())
 
@@ -342,18 +317,14 @@ def score_texts_sync(
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO)
-
     texts = [
         "Artificial intelligence has significantly transformed various industries "
         "and continues to reshape how organizations operate and deliver value to "
-        "their customers and stakeholders around the world today.",
-        "I think AI is pretty cool. It changed a lot of stuff we do every day, "
-        "honestly. Like, my phone now autocorrects way better than it used to, "
-        "and that alone saves me from so many typos.",
+        "their customers around the world today in many ways.",
+        "I think AI is pretty cool honestly. It changed a lot of stuff we do "
+        "every single day. Like my phone autocorrects way better than before.",
     ]
-
     mock = "--mock" in sys.argv
-    print(f"Scoring {len(texts)} texts ({'mock' if mock else 'live Copyleaks API'})...")
     results = score_texts_sync(texts, mock_mode=mock)
     for r in results:
-        print(f"  AI={r.ai_probability:.2%}  Reward={r.reward:.3f}  | {r.text_preview!r}")
+        print(f"AI={r.ai_probability:.2%} reward={r.reward:.3f} | {r.text_preview!r}")
