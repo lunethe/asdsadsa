@@ -1,17 +1,30 @@
-import os
-from train.reward_copyleaks import score_texts_sync
+import os, asyncio, json
+from train.reward_copyleaks import _load_proxies, CopyleaksWorker
 
 proxy_file = os.getenv('PROXY_FILE', '')
 print(f'Proxy file: {proxy_file!r}')
+proxies = _load_proxies(proxy_file)
+print(f'Proxies loaded: {len(proxies)}')
+if proxies:
+    print(f'First proxy: {proxies[0]}')
 
-texts = [
-    'Artificial intelligence has significantly transformed various industries '
-    'and continues to reshape how organizations operate and deliver value to '
-    'their customers around the world today in many ways.',
-    'I think AI is pretty cool honestly. It changed a lot of stuff we do '
-    'every single day, and honestly my phone autocorrects way better now.',
-]
+async def main():
+    worker = CopyleaksWorker(worker_id=0, proxy=proxies[0] if proxies else None)
+    await worker.start()
 
-results = score_texts_sync(texts, num_workers=1, proxy_file=proxy_file or None)
-for r in results:
-    print(f'AI={r.ai_probability:.2%} reward={r.reward:.3f} error={r.error} | {r.text_preview!r}')
+    # Step 1: check what IP the browser is using
+    ip_result = await worker._page.evaluate(
+        "fetch('https://api.ipify.org?format=json').then(r=>r.text())"
+    )
+    print(f'Browser IP: {ip_result}')
+
+    # Step 2: try the API call
+    result = await worker.score(
+        'Artificial intelligence has significantly transformed various industries '
+        'and continues to reshape how organizations operate and deliver value to '
+        'their customers around the world today in many ways.'
+    )
+    print(f'AI={result.ai_probability:.2%} reward={result.reward:.3f} error={result.error}')
+    await worker.stop()
+
+asyncio.run(main())
