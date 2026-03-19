@@ -1,4 +1,8 @@
+import os
 from train.reward_copyleaks import score_texts_sync
+
+proxy_file = os.getenv('PROXY_FILE', '')
+print(f'Proxy file: {proxy_file!r}')
 
 texts = [
     'Artificial intelligence has significantly transformed various industries '
@@ -8,6 +12,6 @@ texts = [
     'every single day, and honestly my phone autocorrects way better now.',
 ]
 
-results = score_texts_sync(texts, num_workers=1)
+results = score_texts_sync(texts, num_workers=1, proxy_file=proxy_file or None)
 for r in results:
     print(f'AI={r.ai_probability:.2%} reward={r.reward:.3f} error={r.error} | {r.text_preview!r}')
