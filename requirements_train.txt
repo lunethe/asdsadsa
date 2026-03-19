@@ -11,7 +11,8 @@ sentencepiece>=0.1.99          # Qwen tokenizer dependency
 tiktoken>=0.7.0                # Qwen tokenizer (fallback)
 
 # ─── Reward scraper ──────────────────────────────────────────────────────────
-playwright>=1.44.0             # Headless browser for Copyleaks scraping
+httpx>=0.27.0                  # Async HTTP client for Copyleaks API
+playwright>=1.44.0             # No longer needed for rewards, kept for optional use
 
 # ─── Inference server (kept from existing app) ───────────────────────────────
 fastapi>=0.104.0
