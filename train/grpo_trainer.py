@@ -176,7 +176,7 @@ def generate_completions(
             completion_ids = outputs[i, prompt_len:]
             text = tokenizer.decode(completion_ids, skip_special_tokens=True).strip()
             group_texts.append(text)
-            group_ids.append(outputs[i])  # full sequence for log_prob computation
+            group_ids.append(outputs[i].detach().cpu())  # detach from inference graph
 
         all_texts.append(group_texts)
         all_input_ids.append(group_ids)
@@ -199,6 +199,9 @@ def compute_sequence_log_probs(
 
     Returns scalar tensor.
     """
+    # Clone to detach from any inference-mode graph (tensors produced inside
+    # torch.no_grad() / generate() cannot be saved for backward as-is).
+    input_ids = input_ids.clone()
     input_ids = input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids
     with torch.no_grad() if not model.training else torch.enable_grad():
         logits = model(input_ids=input_ids).logits  # (1, seq_len, vocab)
