@@ -27,7 +27,7 @@ try:
                 'Referer': EMBEDDED_URL,
                 'Origin': 'https://app.copyleaks.com',
             },
-            content=json.dumps({'text': TEXT}),
+            data=json.dumps({'text': TEXT}),
             timeout=30,
         )
         print(f'  Status: {r.status_code}')
