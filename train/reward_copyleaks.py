@@ -77,6 +77,7 @@ class CopyleaksWorker:
         self._page = None
         self._playwright = None
         self._last_request_at = 0.0
+        self._acdi_token = None
 
     async def start(self):
         try:
@@ -105,9 +106,19 @@ class CopyleaksWorker:
         )
         self._page = await context.new_page()
 
-        # Navigate once to establish session/cookies
+        # Navigate once to establish session/cookies and fetch acdiToken
         await self._page.goto(EMBEDDED_URL, wait_until="domcontentloaded",
                               timeout=int(self.timeout * 1000))
+
+        # Wait for Angular to initialize and store the acdiToken in localStorage
+        await asyncio.sleep(3.0)
+        self._acdi_token = await self._page.evaluate(
+            "const raw = localStorage.getItem('AI_ACDI'); raw ? atob(raw) : null"
+        )
+        if self._acdi_token:
+            logger.info(f"[Worker {self.worker_id}] acdiToken acquired (len={len(self._acdi_token)})")
+        else:
+            logger.warning(f"[Worker {self.worker_id}] acdiToken not found in localStorage")
         logger.info(f"[Worker {self.worker_id}] Browser ready at {EMBEDDED_URL}")
 
     async def stop(self):
@@ -147,6 +158,7 @@ class CopyleaksWorker:
                     try:
                         await self._page.reload(wait_until="domcontentloaded",
                                                 timeout=int(self.timeout * 1000))
+                        await self._refresh_acdi_token()
                     except Exception:
                         pass
                     await asyncio.sleep(5.0 * (attempt + 1))
@@ -155,9 +167,19 @@ class CopyleaksWorker:
         return ScoreResult(text_preview=preview, ai_probability=0.5, reward=0.5,
                            raw={"error": "all_retries_failed"}, error="all_retries_failed")
 
+    async def _refresh_acdi_token(self):
+        """Re-read acdiToken from localStorage (after page reload)."""
+        await asyncio.sleep(3.0)
+        self._acdi_token = await self._page.evaluate(
+            "const raw = localStorage.getItem('AI_ACDI'); raw ? atob(raw) : null"
+        )
+
     async def _fetch_via_browser(self, text: str, preview: str) -> ScoreResult:
         """Call the Copyleaks API via fetch() executed inside the browser page."""
-        payload = json.dumps({"text": text})
+        body_obj = {"text": text}
+        if self._acdi_token:
+            body_obj["acdiToken"] = self._acdi_token
+        payload = json.dumps(body_obj)
 
         # Execute fetch from within the page — same origin, browser cookies, real IP
         result = await self._page.evaluate(
