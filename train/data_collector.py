@@ -37,61 +37,106 @@ def _clean_text(text: str) -> str:
 
 
 def load_hc3_dataset(
-    split: str = "train",
     cache_dir: str = "./data_cache",
     min_chars: int = 200,
     max_chars: int = 2500,
     seed: int = 42,
 ) -> List[TrainingSample]:
     """
-    Load ChatGPT answers from the HC3 dataset.
-    HC3 = Human ChatGPT Comparison Corpus.
-    Each row has 'chatgpt_answers' (list of strings) and 'human_answers'.
-    We use chatgpt_answers as training inputs.
+    Load ChatGPT answers from HC3 by downloading the JSONL directly.
+    HC3's custom loading script is no longer supported by newer datasets
+    versions, so we bypass it entirely and fetch the raw file.
+    """
+    import gzip
+    import json
+    import urllib.request
+    from pathlib import Path
+
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = Path(cache_dir) / "hc3_all.jsonl.gz"
+
+    if not cache_path.exists():
+        url = (
+            "https://huggingface.co/datasets/Hello-SimpleAI/HC3"
+            "/resolve/main/all.jsonl.gz"
+        )
+        logger.info(f"Downloading HC3 from {url} ...")
+        urllib.request.urlretrieve(url, cache_path)
+        logger.info(f"Saved to {cache_path}")
+
+    samples = []
+    rng = random.Random(seed)
+
+    logger.info("Parsing HC3 JSONL...")
+    with gzip.open(cache_path, "rt", encoding="utf-8") as f:
+        for idx, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            answers = row.get("chatgpt_answers") or []
+            if isinstance(answers, str):
+                answers = [answers]
+            for ans in answers:
+                if not ans:
+                    continue
+                text = _clean_text(ans)
+                if min_chars <= len(text) <= max_chars:
+                    samples.append(TrainingSample(
+                        text=text,
+                        source="HC3",
+                        original_id=f"hc3_{idx}",
+                    ))
+
+    rng.shuffle(samples)
+    logger.info(f"HC3: loaded {len(samples)} ChatGPT answer samples")
+    return samples
+
+
+def load_alpaca_dataset(
+    cache_dir: str = "./data_cache",
+    min_chars: int = 200,
+    max_chars: int = 2500,
+    seed: int = 42,
+) -> List[TrainingSample]:
+    """
+    Fallback dataset: Alpaca (GPT-3.5 instruction-following outputs).
+    Concatenates instruction + output as the AI text to humanize.
     """
     try:
         from datasets import load_dataset
     except ImportError:
         raise ImportError("Run: pip install datasets")
 
-    logger.info("Downloading Hello-SimpleAI/HC3 (English subset)...")
-    try:
-        ds = load_dataset(
-            "Hello-SimpleAI/HC3",
-            "all",
-            split=split,
-            cache_dir=cache_dir,
-            trust_remote_code=True,
-        )
-    except Exception as e:
-        logger.warning(f"HC3 'all' failed ({e}), trying without config...")
-        ds = load_dataset(
-            "Hello-SimpleAI/HC3",
-            split=split,
-            cache_dir=cache_dir,
-            trust_remote_code=True,
-        )
+    logger.info("Downloading tatsu-lab/alpaca (GPT-3.5 outputs)...")
+    ds = load_dataset("tatsu-lab/alpaca", split="train", cache_dir=cache_dir)
 
     samples = []
     rng = random.Random(seed)
 
     for idx, row in enumerate(ds):
-        answers = row.get("chatgpt_answers") or []
-        if isinstance(answers, str):
-            answers = [answers]
-        for ans in answers:
-            if not ans:
-                continue
-            text = _clean_text(ans)
-            if min_chars <= len(text) <= max_chars:
-                samples.append(TrainingSample(
-                    text=text,
-                    source="HC3",
-                    original_id=f"hc3_{idx}",
-                ))
+        # Combine instruction + output into a self-contained AI-written paragraph
+        instruction = (row.get("instruction") or "").strip()
+        output = (row.get("output") or "").strip()
+        if not output:
+            continue
+        # Only take rows with paragraph-style outputs (not bullet lists/code)
+        if output.startswith("-") or output.startswith("#") or "```" in output:
+            continue
+        text = _clean_text(f"{output}")
+        if min_chars <= len(text) <= max_chars:
+            samples.append(TrainingSample(
+                text=text,
+                source="Alpaca",
+                original_id=f"alpaca_{idx}",
+            ))
 
     rng.shuffle(samples)
-    logger.info(f"HC3: loaded {len(samples)} ChatGPT answer samples")
+    logger.info(f"Alpaca: loaded {len(samples)} GPT-3.5 output samples")
     return samples
 
 
@@ -107,7 +152,25 @@ def load_all_datasets(
 
     for name in dataset_names:
         if "HC3" in name or "hc3" in name:
-            samples = load_hc3_dataset(
+            try:
+                samples = load_hc3_dataset(
+                    cache_dir=cache_dir,
+                    min_chars=min_chars,
+                    max_chars=max_chars,
+                    seed=seed,
+                )
+                all_samples.extend(samples)
+            except Exception as e:
+                logger.warning(f"HC3 failed ({e}), falling back to Alpaca dataset.")
+                samples = load_alpaca_dataset(
+                    cache_dir=cache_dir,
+                    min_chars=min_chars,
+                    max_chars=max_chars,
+                    seed=seed,
+                )
+                all_samples.extend(samples)
+        elif "alpaca" in name.lower():
+            samples = load_alpaca_dataset(
                 cache_dir=cache_dir,
                 min_chars=min_chars,
                 max_chars=max_chars,
