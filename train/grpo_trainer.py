@@ -506,11 +506,11 @@ async def _training_loop(
         for group in completions_by_prompt:
             flat_completions.extend(group)
 
-        # Also apply DIPPER-style post-processing before scoring so Copyleaks
-        # sees the same text that the inference pipeline would produce.
-        # (Import lazy to avoid loading DIPPER during training)
+        # Apply post-processing before scoring (same pipeline as inference).
+        # Import from app.postprocess, NOT app.main — importing main.py would
+        # trigger DIPPER model loading and fill the disk.
         try:
-            from app.main import post_process
+            from app.postprocess import post_process
             scored_texts = [post_process(t) for t in flat_completions]
         except Exception:
             scored_texts = flat_completions  # fallback: score raw completions
