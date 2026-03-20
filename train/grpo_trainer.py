@@ -41,7 +41,7 @@ from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 from .config import Config
 from .data_collector import InfiniteDataLoader, load_all_datasets, TrainingSample
-from .reward_local import LocalRewardPool, ScoreResult
+from .reward_copyleaks import CopyleaksRewardPool, ScoreResult
 from .reward_gptzero import GPTZeroRewardPool
 
 logger = logging.getLogger(__name__)
@@ -430,8 +430,9 @@ class GRPOTrainer:
 
         # ── Reward pool ───────────────────────────────────────────────────
         async def run_training():
-            async with LocalRewardPool(
+            async with CopyleaksRewardPool(
                 mock_mode=cfg.copyleaks.mock_mode,
+                num_workers=cfg.copyleaks.num_workers,
             ) as reward_pool:
                 await _training_loop(
                     cfg, model, tokenizer, dataloader, optimizer, scheduler,
@@ -452,7 +453,7 @@ async def _training_loop(
     dataloader: InfiniteDataLoader,
     optimizer,
     scheduler,
-    reward_pool: LocalRewardPool,
+    reward_pool: CopyleaksRewardPool,
     log_fn,
     save_fn,
 ):
