@@ -1,8 +1,10 @@
 """
 Local AI-Detection Reward Function
 ====================================
-Uses a frozen RoBERTa classifier (Hello-SimpleAI/chatgpt-detector-roberta)
+Uses a frozen DeBERTa-v3-Large classifier (desklib/ai-text-detector-v1.01)
 to score text. Runs on the same GPU as training — no network, no captcha.
+
+RAID benchmark #1 (Jan 2025) — trained on GPT-4, Claude, Gemini, Llama, Mistral etc.
 
 Reward = P(human)  (1.0 = fully human, 0.0 = fully AI)
 """
@@ -15,8 +17,8 @@ from typing import List, Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-# RAID benchmark #1 (Jan 2025) — DeBERTa-v3-Large trained on diverse modern LLMs
-# (GPT-4, Claude, Gemini, Llama, Mistral etc.). Safetensors format, no torch version issues.
+# RAID benchmark #1 (Jan 2025) — DeBERTa-v3-Large trained on diverse modern LLMs.
+# Checkpoint uses "model.*" key prefix and num_labels=1 (sigmoid) — loaded manually below.
 MODEL_ID = "desklib/ai-text-detector-v1.01"
 MIN_CHARS = 100
 MAX_CHARS = 10000
@@ -42,7 +44,7 @@ def _prepare_text(text: str) -> str:
 
 class LocalDetectorWorker:
     """
-    Wraps a frozen RoBERTa AI-detector pipeline.
+    Wraps a frozen DeBERTa-v3-Large AI-detector (desklib/ai-text-detector-v1.01).
     Loads once on start(); scores are synchronous CPU/GPU inference.
     """
 
@@ -52,14 +54,48 @@ class LocalDetectorWorker:
         self._pipe = None
 
     def start_sync(self):
-        from transformers import pipeline
         import torch
+        import safetensors.torch
+        from huggingface_hub import hf_hub_download
+        from transformers import (
+            AutoTokenizer, AutoConfig,
+            DebertaV2ForSequenceClassification,
+            pipeline as hf_pipeline,
+        )
 
-        device_idx = 0 if (self.device == "auto" and __import__("torch").cuda.is_available()) else -1
+        device_idx = 0 if (self.device == "auto" and torch.cuda.is_available()) else -1
         logger.info(f"[Detector] Loading {MODEL_ID} on device={device_idx}")
-        self._pipe = pipeline(
+
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+
+        # desklib checkpoint uses num_labels=1 (sigmoid binary) not 2 (softmax)
+        config = AutoConfig.from_pretrained(MODEL_ID)
+        config.num_labels = 1
+        model = DebertaV2ForSequenceClassification(config)
+
+        # Checkpoint keys use "model.*" prefix; HF expects "deberta.*" — remap them
+        ckpt_path = hf_hub_download(MODEL_ID, "model.safetensors")
+        raw_sd = safetensors.torch.load_file(ckpt_path)
+        remapped = {}
+        for k, v in raw_sd.items():
+            if k.startswith("model."):
+                remapped["deberta." + k[len("model."):]] = v
+            else:
+                remapped[k] = v
+        missing, unexpected = model.load_state_dict(remapped, strict=False)
+        if missing:
+            logger.warning(f"[Detector] Missing keys (first 5): {missing[:5]}")
+        if unexpected:
+            logger.warning(f"[Detector] Unexpected keys (first 5): {unexpected[:5]}")
+
+        if device_idx >= 0:
+            model = model.cuda(device_idx)
+        model.eval()
+
+        self._pipe = hf_pipeline(
             "text-classification",
-            model=MODEL_ID,
+            model=model,
+            tokenizer=tokenizer,
             device=device_idx,
             truncation=True,
             max_length=512,
@@ -84,11 +120,11 @@ class LocalDetectorWorker:
         loop = asyncio.get_event_loop()
         try:
             result = await loop.run_in_executor(None, self._pipe, text)
-            # Model returns [{"label": "ChatGPT"/"Human", "score": 0.xx}]
             label = result[0]["label"].lower()
             score = float(result[0]["score"])
-            # Labels vary by model: "ai"/"fake"/"generated" → ai_prob = score
-            # "human"/"real" → ai_prob = 1 - score
+            # desklib uses num_labels=1 sigmoid: LABEL_0 score = P(AI).
+            # For named labels: "human"/"real" → ai_prob = 1 - score
+            # For "ai"/"generated"/"label_0" → ai_prob = score
             if any(w in label for w in ("human", "real", "original")):
                 ai_prob = 1.0 - score
             else:
