@@ -1,44 +1,42 @@
 """
-Copyleaks Reward Function
-==========================
-Drives the Copyleaks embedded AI detector via Playwright UI automation.
+Copyleaks Reward Function (CapSolver edition)
+==============================================
+Solves the Cloudflare Turnstile on Copyleaks using CapSolver, then POSTs
+directly to the anonymous AI-scan API.  No browser / Playwright needed.
 
-Root cause of previous 403s:
-  The API requires a Cloudflare Turnstile captchaResponse in the POST body.
-  Direct fetch() calls lack this token. Only the Angular app, after the
-  Turnstile widget runs, injects it. Solution: drive the UI (click Scan),
-  intercept the response via page.on('response').
-
-Strategy:
-  1. Keep one Playwright page open at app.copyleaks.com/v1/scan/ai/embedded
-  2. For each text: fill the editor → click Scan → intercept API response
-  3. The Turnstile widget runs automatically and injects captchaResponse
-  4. Parse summary.ai from the intercepted JSON response
+Set env var: CAPSOLVER_API_KEY=your_key_here
+Get a key at: https://capsolver.com
 
 Reward = summary.human  (1.0 = fully human, 0.0 = fully AI)
 """
 
 import asyncio
-import json
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
-EMBEDDED_URL = "https://app.copyleaks.com/v1/scan/ai/embedded"
-API_URL = "https://app.copyleaks.com/api/v2/dashboard/anonymous/ai-scan/submit/text"
+CAPSOLVER_URL      = "https://api.capsolver.com"
+COPYLEAKS_SCAN_URL = "https://app.copyleaks.com/api/v2/dashboard/anonymous/ai-scan/submit/text"
+TURNSTILE_SITEKEY  = "0x4AAAAAAADZUXiboAFN3tU8"
+TURNSTILE_PAGE_URL = "https://app.copyleaks.com/v1/scan/ai/embedded"
+
 MIN_CHARS = 150
 MAX_CHARS = 25000
+DEFAULT_RATE_LIMIT = 4.0   # seconds between requests per worker
 
 
 @dataclass
 class ScoreResult:
     text_preview: str
-    ai_probability: float   # 0.0 = human, 1.0 = AI
-    reward: float           # 1.0 - ai_probability
+    ai_probability: float
+    reward: float
     raw: Dict[str, Any]
     error: Optional[str] = None
 
@@ -52,76 +50,96 @@ def _prepare_text(text: str) -> str:
     return text
 
 
+async def _solve_turnstile(client: httpx.AsyncClient, api_key: str) -> str:
+    """
+    Use CapSolver to solve the Copyleaks Turnstile widget.
+    Returns the captchaResponse token string.
+    """
+    # 1. Create task
+    create_resp = await client.post(
+        f"{CAPSOLVER_URL}/createTask",
+        json={
+            "clientKey": api_key,
+            "task": {
+                "type": "AntiTurnstileTaskProxyLess",
+                "websiteURL": TURNSTILE_PAGE_URL,
+                "websiteKey": TURNSTILE_SITEKEY,
+            },
+        },
+        timeout=30.0,
+    )
+    create_resp.raise_for_status()
+    create_data = create_resp.json()
+    if create_data.get("errorId", 0) != 0:
+        raise RuntimeError(f"CapSolver createTask error: {create_data}")
+    task_id = create_data["taskId"]
+
+    # 2. Poll for result
+    for _ in range(30):
+        await asyncio.sleep(3.0)
+        result_resp = await client.post(
+            f"{CAPSOLVER_URL}/getTaskResult",
+            json={"clientKey": api_key, "taskId": task_id},
+            timeout=30.0,
+        )
+        result_resp.raise_for_status()
+        result_data = result_resp.json()
+        if result_data.get("errorId", 0) != 0:
+            raise RuntimeError(f"CapSolver getTaskResult error: {result_data}")
+        if result_data.get("status") == "ready":
+            token = result_data["solution"]["token"]
+            logger.debug(f"[CapSolver] Turnstile token obtained")
+            return token
+
+    raise RuntimeError("CapSolver timed out waiting for Turnstile solution")
+
+
 class CopyleaksWorker:
     """
-    One Playwright browser page at the Copyleaks embedded detector.
-    Scores texts by driving the Angular UI (fill + click Scan) so that
-    Cloudflare Turnstile auto-completes and injects captchaResponse.
+    Scores texts via Copyleaks anonymous AI detector.
+    Uses CapSolver to solve Turnstile on each request.
     """
 
     def __init__(
         self,
-        worker_id: int,
-        rate_limit: float = 4.0,
+        worker_id: int = 0,
+        api_key: Optional[str] = None,
+        rate_limit: float = DEFAULT_RATE_LIMIT,
         max_retries: int = 3,
         timeout: float = 60.0,
-        headless: bool = True,
-        proxy: Optional[str] = None,
     ):
         self.worker_id = worker_id
+        self.api_key = api_key or os.getenv("CAPSOLVER_API_KEY", "")
         self.rate_limit = rate_limit
         self.max_retries = max_retries
         self.timeout = timeout
-        self.headless = headless
-        self.proxy = proxy
-        self._browser = None
-        self._page = None
-        self._playwright = None
+        self._client: Optional[httpx.AsyncClient] = None
         self._last_request_at = 0.0
-        self._on_results_page = False
+
+        if not self.api_key:
+            raise ValueError("CAPSOLVER_API_KEY not set. Export it or pass api_key=")
 
     async def start(self):
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError:
-            raise ImportError("Run: pip install playwright && playwright install chromium")
-
-        self._playwright = await async_playwright().start()
-
-        launch_kwargs = dict(
-            headless=self.headless,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-            ],
+        self._client = httpx.AsyncClient(
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Content-Type": "application/json",
+                "Origin": "https://app.copyleaks.com",
+                "Referer": "https://app.copyleaks.com/v1/scan/ai/embedded",
+            },
+            timeout=self.timeout,
         )
-        if self.proxy:
-            launch_kwargs["proxy"] = {"server": self.proxy}
-
-        self._browser = await self._playwright.chromium.launch(**launch_kwargs)
-        context = await self._browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-        )
-        self._page = await context.new_page()
-
-        await self._page.goto(EMBEDDED_URL, wait_until="networkidle",
-                              timeout=int(self.timeout * 1000))
-        # Wait for Angular + Turnstile to initialise
-        await asyncio.sleep(3.0)
-        logger.info(f"[Worker {self.worker_id}] Browser ready at {EMBEDDED_URL}")
+        logger.info(f"[Copyleaks Worker {self.worker_id}] Ready")
 
     async def stop(self):
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
+        if self._client:
+            await self._client.aclose()
 
     async def _wait_rate_limit(self):
         elapsed = time.monotonic() - self._last_request_at
@@ -130,171 +148,63 @@ class CopyleaksWorker:
             await asyncio.sleep(wait + random.uniform(0.2, 1.0))
         self._last_request_at = time.monotonic()
 
-    async def _reset_to_input(self):
-        """Navigate back to the input form (click Try Again if on results page)."""
-        try:
-            try_again = await self._page.query_selector(".try-again-btn")
-            if try_again:
-                await try_again.click()
-                await asyncio.sleep(0.8)
-                self._on_results_page = False
-        except Exception:
-            pass
-
-    async def _fill_editor(self, text: str):
-        """Type text into the Angular scan editor."""
-        # Click a chip to populate editor (chip buttons are always clickable)
-        chip = await self._page.query_selector(
-            "mat-chip-option .mdc-evolution-chip__action"
-        )
-        if chip:
-            await chip.click()
-            await asyncio.sleep(1.0)
-
-        # Check what Angular component holds the text by finding the PT key in localStorage
-        # PT stores the editor text (base64 encoded). We can set it directly.
-        await self._page.evaluate(
-            """(txt) => {
-                // Set PT (editor text) in localStorage — Angular reads this
-                localStorage.setItem('PT', btoa(encodeURIComponent(txt)));
-
-                // Also try directly on the editor element
-                const editor = document.querySelector('.scan-text-editor');
-                if (editor) {
-                    // Try setting via nativeElement value setter
-                    const proto = Object.getOwnPropertyDescriptor(
-                        window.HTMLElement.prototype, 'textContent'
-                    );
-                    if (proto && proto.set) {
-                        proto.set.call(editor, txt);
-                    } else {
-                        editor.textContent = txt;
-                    }
-                    editor.dispatchEvent(new InputEvent('input', {bubbles: true}));
-                    editor.dispatchEvent(new Event('change', {bubbles: true}));
-                }
-            }""",
-            text,
-        )
-        await asyncio.sleep(0.5)
-
-        # Verify what's in the editor
-        actual_len = await self._page.evaluate(
-            "document.querySelector('.scan-text-editor')?.textContent?.length || 0"
-        )
-        logger.info(f"[Worker {self.worker_id}] Editor content length: {actual_len} chars")
-        if actual_len < MIN_CHARS:
-            # Last resort: use page.keyboard.type() — slower but works anywhere
-            logger.warning(f"[Worker {self.worker_id}] Paste failed, falling back to keyboard.type()")
-            editor = await self._page.query_selector(".scan-text-editor")
-            if editor:
-                await editor.click(force=True)
-                await asyncio.sleep(0.3)
-            await self._page.keyboard.press("Control+a")
-            await self._page.keyboard.type(text[:2000], delay=0)  # cap at 2000 chars for speed
-            await asyncio.sleep(0.3)
-
     async def score(self, text: str) -> ScoreResult:
         text = _prepare_text(text)
         preview = text[:80].replace("\n", " ")
 
         if len(text) < MIN_CHARS:
-            logger.warning(f"[Worker {self.worker_id}] Text too short ({len(text)} chars)")
             return ScoreResult(text_preview=preview, ai_probability=0.5, reward=0.5,
                                raw={"error": "too_short"}, error="too_short")
 
         for attempt in range(self.max_retries):
             try:
                 await self._wait_rate_limit()
-                result = await self._score_via_ui(text, preview)
-                return result
+
+                # Solve Turnstile fresh for each request
+                token = await _solve_turnstile(self._client, self.api_key)
+
+                resp = await self._client.post(
+                    COPYLEAKS_SCAN_URL,
+                    json={
+                        "text": text,
+                        "captchaResponse": token,
+                        "acdiToken": None,
+                    },
+                )
+
+                if resp.status_code == 429:
+                    wait = int(resp.headers.get("Retry-After", 60))
+                    logger.warning(f"[Copyleaks Worker {self.worker_id}] Rate limited, sleeping {wait}s")
+                    await asyncio.sleep(wait)
+                    continue
+
+                if resp.status_code != 200:
+                    raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+
+                data = resp.json()
+                summary = data.get("summary", {})
+                ai_prob = float(summary.get("ai", 0.5))
+                ai_prob = max(0.0, min(1.0, ai_prob))
+                reward = 1.0 - ai_prob
+
+                logger.info(
+                    f"[Copyleaks Worker {self.worker_id}] AI={ai_prob:.2%} "
+                    f"reward={reward:.3f} | {preview!r}"
+                )
+                return ScoreResult(text_preview=preview, ai_probability=ai_prob,
+                                   reward=reward, raw=data)
+
             except Exception as e:
                 logger.warning(
-                    f"[Worker {self.worker_id}] Attempt {attempt + 1}/{self.max_retries} "
-                    f"failed: {e}"
+                    f"[Copyleaks Worker {self.worker_id}] Attempt {attempt+1}/"
+                    f"{self.max_retries} failed: {e}"
                 )
                 if attempt < self.max_retries - 1:
-                    try:
-                        await self._page.goto(EMBEDDED_URL, wait_until="networkidle",
-                                              timeout=int(self.timeout * 1000))
-                        await asyncio.sleep(3.0)
-                        self._on_results_page = False
-                    except Exception:
-                        pass
                     await asyncio.sleep(5.0 * (attempt + 1))
 
-        logger.error(f"[Worker {self.worker_id}] All retries failed: {preview!r}")
         return ScoreResult(text_preview=preview, ai_probability=0.5, reward=0.5,
                            raw={"error": "all_retries_failed"}, error="all_retries_failed")
 
-    async def _score_via_ui(self, text: str, preview: str) -> ScoreResult:
-        """Drive the Angular UI: fill text → click Scan → intercept response."""
-        response_holder: Dict[str, Any] = {}
-        response_event = asyncio.Event()
-
-        async def on_response(response):
-            if "copyleaks.com" in response.url:
-                logger.info(f"[Worker {self.worker_id}] Response: {response.status} {response.url[:80]}")
-            if API_URL in response.url and "status" not in response_holder:
-                try:
-                    body = await response.text()
-                    response_holder["status"] = response.status
-                    response_holder["body"] = body
-                    response_event.set()
-                except Exception as e:
-                    logger.warning(f"[Worker {self.worker_id}] Failed to read response body: {e}")
-
-        self._page.on("response", on_response)
-        try:
-            # Return to input form if we're on the results page
-            await self._reset_to_input()
-
-            # Fill the text editor
-            await self._fill_editor(text)
-
-            # Find and click the Scan button
-            # The "Scan" button is the only mdc-button--raised on the input page
-            scan_btn = await self._page.query_selector("button.mdc-button--raised")
-            if not scan_btn:
-                raise RuntimeError("Scan button not found")
-
-            await scan_btn.click()
-            self._on_results_page = True
-
-            # Wait for the API response
-            try:
-                await asyncio.wait_for(response_event.wait(), timeout=self.timeout)
-            except asyncio.TimeoutError:
-                raise RuntimeError(f"Timeout ({self.timeout}s) waiting for scan response")
-
-        finally:
-            self._page.remove_listener("response", on_response)
-
-        status = response_holder["status"]
-        body = response_holder["body"]
-
-        if status == 429:
-            raise RuntimeError("rate_limited (429)")
-        if status != 200:
-            raise RuntimeError(f"HTTP {status}: {body[:200]}")
-
-        data = json.loads(body)
-        summary = data.get("summary", {})
-        ai_prob = float(summary.get("ai", 0.5))
-        ai_prob = max(0.0, min(1.0, ai_prob))
-        reward = 1.0 - ai_prob
-
-        logger.info(
-            f"[Worker {self.worker_id}] AI={ai_prob:.2%} → reward={reward:.3f} "
-            f"| {preview!r}"
-        )
-        return ScoreResult(text_preview=preview, ai_probability=ai_prob,
-                           reward=reward, raw=data)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Mock worker
-# ─────────────────────────────────────────────────────────────────────────────
 
 class MockRewardWorker:
     def __init__(self, worker_id: int = 0):
@@ -310,57 +220,30 @@ class MockRewardWorker:
                            reward=1.0 - ai_prob, raw={"mock": True})
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pool
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _load_proxies(proxy_file: str) -> list:
-    import os
-    if not proxy_file or not os.path.exists(proxy_file):
-        return []
-    proxies = []
-    with open(proxy_file) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if not line.startswith("http"):
-                line = f"http://{line}"
-            proxies.append(line)
-    return proxies
-
-
 class CopyleaksRewardPool:
-    """
-    Manages N browser workers. Each keeps a persistent page open and
-    drives the Copyleaks UI to score texts (Turnstile-safe).
-    """
+    """Pool of workers. Each worker solves its own Turnstile per request."""
 
     def __init__(
         self,
         num_workers: int = 2,
-        rate_limit: float = 4.0,
+        rate_limit: float = DEFAULT_RATE_LIMIT,
         timeout: float = 60.0,
         max_retries: int = 3,
         mock_mode: bool = False,
-        headless: bool = True,
-        proxy_file: str = None,
+        api_key: Optional[str] = None,
+        **kwargs,
     ):
         self.mock_mode = mock_mode
         if mock_mode:
             self._workers = [MockRewardWorker(i) for i in range(num_workers)]
         else:
-            proxies = _load_proxies(proxy_file) if proxy_file else []
-            if proxies:
-                logger.info(f"Loaded {len(proxies)} proxies for {num_workers} workers")
             self._workers = [
                 CopyleaksWorker(
                     worker_id=i,
+                    api_key=api_key,
                     rate_limit=rate_limit,
                     timeout=timeout,
                     max_retries=max_retries,
-                    headless=headless,
-                    proxy=proxies[i % len(proxies)] if proxies else None,
                 )
                 for i in range(num_workers)
             ]
@@ -372,16 +255,13 @@ class CopyleaksRewardPool:
     async def __aexit__(self, *args):
         await asyncio.gather(*[w.stop() for w in self._workers])
 
-    async def score_batch(self, texts: List[str]) -> List["ScoreResult"]:
+    async def score_batch(self, texts: List[str]) -> List[ScoreResult]:
         assignments = [[] for _ in self._workers]
         for i, text in enumerate(texts):
             assignments[i % len(self._workers)].append(text)
 
         async def worker_task(worker, worker_texts):
-            results = []
-            for t in worker_texts:
-                results.append(await worker.score(t))
-            return results
+            return [await worker.score(t) for t in worker_texts]
 
         worker_results = await asyncio.gather(*[
             worker_task(w, assignments[i]) for i, w in enumerate(self._workers)
@@ -396,14 +276,9 @@ class CopyleaksRewardPool:
         return ordered
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Sync wrapper + CLI test
-# ─────────────────────────────────────────────────────────────────────────────
-
-def score_texts_sync(texts, num_workers=2, mock_mode=False, **kwargs):
+def score_texts_sync(texts, mock_mode=False, **kwargs):
     async def _run():
-        async with CopyleaksRewardPool(num_workers=num_workers,
-                                       mock_mode=mock_mode, **kwargs) as pool:
+        async with CopyleaksRewardPool(mock_mode=mock_mode, **kwargs) as pool:
             return await pool.score_batch(texts)
     return asyncio.run(_run())
 
@@ -415,8 +290,8 @@ if __name__ == "__main__":
         "Artificial intelligence has significantly transformed various industries "
         "and continues to reshape how organizations operate and deliver value to "
         "their customers around the world today in many ways.",
-        "I think AI is pretty cool honestly. It changed a lot of stuff we do "
-        "every single day. Like my phone autocorrects way better than before.",
+        "honestly i just dont get why my cat knocks stuff off the table. like she "
+        "looks me dead in the eye and just pushes my cup off. why",
     ]
     mock = "--mock" in sys.argv
     results = score_texts_sync(texts, mock_mode=mock)
