@@ -1,19 +1,19 @@
 """
 Copyleaks Reward Function
 ==========================
-Calls the Copyleaks AI-scan API from within a Playwright browser context.
-Direct HTTP calls from datacenter IPs (RunPod) get 403'd — using the browser
-as a proxy routes requests through a residential-looking browser session.
+Drives the Copyleaks embedded AI detector via Playwright UI automation.
+
+Root cause of previous 403s:
+  The API requires a Cloudflare Turnstile captchaResponse in the POST body.
+  Direct fetch() calls lack this token. Only the Angular app, after the
+  Turnstile widget runs, injects it. Solution: drive the UI (click Scan),
+  intercept the response via page.on('response').
 
 Strategy:
-  1. Open one persistent browser page at app.copyleaks.com/v1/scan/ai/embedded
-  2. For each text, call fetch() via page.evaluate() (same-origin, browser cookies)
-  3. Parse summary.ai from the JSON response
-
-Endpoint (discovered by intercepting browser network traffic):
-  POST /api/v2/dashboard/anonymous/ai-scan/submit/text
-  Body: {"text": "<string, min 150 chars>"}
-  Response: {"summary": {"ai": 0.95, "human": 0.05}, ...}
+  1. Keep one Playwright page open at app.copyleaks.com/v1/scan/ai/embedded
+  2. For each text: fill the editor → click Scan → intercept API response
+  3. The Turnstile widget runs automatically and injects captchaResponse
+  4. Parse summary.ai from the intercepted JSON response
 
 Reward = summary.human  (1.0 = fully human, 0.0 = fully AI)
 """
@@ -29,7 +29,7 @@ from typing import List, Optional, Dict, Any
 logger = logging.getLogger(__name__)
 
 EMBEDDED_URL = "https://app.copyleaks.com/v1/scan/ai/embedded"
-API_PATH = "/api/v2/dashboard/anonymous/ai-scan/submit/text"
+API_URL = "https://app.copyleaks.com/api/v2/dashboard/anonymous/ai-scan/submit/text"
 MIN_CHARS = 150
 MAX_CHARS = 25000
 
@@ -54,8 +54,9 @@ def _prepare_text(text: str) -> str:
 
 class CopyleaksWorker:
     """
-    One Playwright browser page kept open at the Copyleaks embedded detector.
-    Scores texts by calling fetch() from within the page (bypasses IP blocks).
+    One Playwright browser page at the Copyleaks embedded detector.
+    Scores texts by driving the Angular UI (fill + click Scan) so that
+    Cloudflare Turnstile auto-completes and injects captchaResponse.
     """
 
     def __init__(
@@ -63,7 +64,7 @@ class CopyleaksWorker:
         worker_id: int,
         rate_limit: float = 4.0,
         max_retries: int = 3,
-        timeout: float = 30.0,
+        timeout: float = 60.0,
         headless: bool = True,
         proxy: Optional[str] = None,
     ):
@@ -77,7 +78,7 @@ class CopyleaksWorker:
         self._page = None
         self._playwright = None
         self._last_request_at = 0.0
-        self._acdi_token = None
+        self._on_results_page = False
 
     async def start(self):
         try:
@@ -89,8 +90,12 @@ class CopyleaksWorker:
 
         launch_kwargs = dict(
             headless=self.headless,
-            args=["--no-sandbox", "--disable-setuid-sandbox",
-                  "--disable-blink-features=AutomationControlled"],
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+            ],
         )
         if self.proxy:
             launch_kwargs["proxy"] = {"server": self.proxy}
@@ -106,19 +111,10 @@ class CopyleaksWorker:
         )
         self._page = await context.new_page()
 
-        # Navigate once to establish session/cookies and fetch acdiToken
-        await self._page.goto(EMBEDDED_URL, wait_until="domcontentloaded",
+        await self._page.goto(EMBEDDED_URL, wait_until="networkidle",
                               timeout=int(self.timeout * 1000))
-
-        # Wait for Angular to initialize and store the acdiToken in localStorage
+        # Wait for Angular + Turnstile to initialise
         await asyncio.sleep(3.0)
-        self._acdi_token = await self._page.evaluate(
-            "const raw = localStorage.getItem('AI_ACDI'); raw ? atob(raw) : null"
-        )
-        if self._acdi_token:
-            logger.info(f"[Worker {self.worker_id}] acdiToken acquired (len={len(self._acdi_token)})")
-        else:
-            logger.warning(f"[Worker {self.worker_id}] acdiToken not found in localStorage")
         logger.info(f"[Worker {self.worker_id}] Browser ready at {EMBEDDED_URL}")
 
     async def stop(self):
@@ -134,6 +130,45 @@ class CopyleaksWorker:
             await asyncio.sleep(wait + random.uniform(0.2, 1.0))
         self._last_request_at = time.monotonic()
 
+    async def _reset_to_input(self):
+        """Navigate back to the input form (click Try Again if on results page)."""
+        try:
+            try_again = await self._page.query_selector(".try-again-btn")
+            if try_again:
+                await try_again.click()
+                await asyncio.sleep(0.8)
+                self._on_results_page = False
+        except Exception:
+            pass
+
+    async def _fill_editor(self, text: str):
+        """Type text into the Angular scan editor."""
+        # Click into the editor area to focus it
+        await self._page.click(".scan-text-editor-container")
+        await asyncio.sleep(0.3)
+        # Select all existing content and replace
+        await self._page.keyboard.press("Control+a")
+        await asyncio.sleep(0.1)
+        # Type text — use clipboard paste for speed on long texts
+        await self._page.evaluate(
+            """async (txt) => {
+                try {
+                    await navigator.clipboard.writeText(txt);
+                } catch(e) {
+                    // clipboard may be blocked headless — fall back to input event
+                    const el = document.querySelector('.scan-text-editor');
+                    if (el) {
+                        el.textContent = txt;
+                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                    }
+                }
+            }""",
+            text,
+        )
+        # Paste via Ctrl+V
+        await self._page.keyboard.press("Control+v")
+        await asyncio.sleep(0.3)
+
     async def score(self, text: str) -> ScoreResult:
         text = _prepare_text(text)
         preview = text[:80].replace("\n", " ")
@@ -146,7 +181,7 @@ class CopyleaksWorker:
         for attempt in range(self.max_retries):
             try:
                 await self._wait_rate_limit()
-                result = await self._fetch_via_browser(text, preview)
+                result = await self._score_via_ui(text, preview)
                 return result
             except Exception as e:
                 logger.warning(
@@ -154,11 +189,11 @@ class CopyleaksWorker:
                     f"failed: {e}"
                 )
                 if attempt < self.max_retries - 1:
-                    # Reload the page in case the session expired
                     try:
-                        await self._page.reload(wait_until="domcontentloaded",
-                                                timeout=int(self.timeout * 1000))
-                        await self._refresh_acdi_token()
+                        await self._page.goto(EMBEDDED_URL, wait_until="networkidle",
+                                              timeout=int(self.timeout * 1000))
+                        await asyncio.sleep(3.0)
+                        self._on_results_page = False
                     except Exception:
                         pass
                     await asyncio.sleep(5.0 * (attempt + 1))
@@ -167,39 +202,49 @@ class CopyleaksWorker:
         return ScoreResult(text_preview=preview, ai_probability=0.5, reward=0.5,
                            raw={"error": "all_retries_failed"}, error="all_retries_failed")
 
-    async def _refresh_acdi_token(self):
-        """Re-read acdiToken from localStorage (after page reload)."""
-        await asyncio.sleep(3.0)
-        self._acdi_token = await self._page.evaluate(
-            "const raw = localStorage.getItem('AI_ACDI'); raw ? atob(raw) : null"
-        )
+    async def _score_via_ui(self, text: str, preview: str) -> ScoreResult:
+        """Drive the Angular UI: fill text → click Scan → intercept response."""
+        response_holder: Dict[str, Any] = {}
+        response_event = asyncio.Event()
 
-    async def _fetch_via_browser(self, text: str, preview: str) -> ScoreResult:
-        """Call the Copyleaks API via fetch() executed inside the browser page."""
-        body_obj = {"text": text}
-        if self._acdi_token:
-            body_obj["acdiToken"] = self._acdi_token
-        payload = json.dumps(body_obj)
+        async def on_response(response):
+            if API_URL in response.url and "status" not in response_holder:
+                try:
+                    body = await response.text()
+                    response_holder["status"] = response.status
+                    response_holder["body"] = body
+                    response_event.set()
+                except Exception:
+                    pass
 
-        # Execute fetch from within the page — same origin, browser cookies, real IP
-        result = await self._page.evaluate(
-            """async ([apiPath, payload]) => {
-                const resp = await fetch(apiPath, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Accept': 'application/json, text/plain, */*',
-                    },
-                    body: payload,
-                });
-                const text = await resp.text();
-                return { status: resp.status, body: text };
-            }""",
-            [API_PATH, payload],
-        )
+        self._page.on("response", on_response)
+        try:
+            # Return to input form if we're on the results page
+            await self._reset_to_input()
 
-        status = result["status"]
-        body = result["body"]
+            # Fill the text editor
+            await self._fill_editor(text)
+
+            # Find and click the Scan button
+            # The "Scan" button is the only mdc-button--raised on the input page
+            scan_btn = await self._page.query_selector("button.mdc-button--raised")
+            if not scan_btn:
+                raise RuntimeError("Scan button not found")
+
+            await scan_btn.click()
+            self._on_results_page = True
+
+            # Wait for the API response
+            try:
+                await asyncio.wait_for(response_event.wait(), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"Timeout ({self.timeout}s) waiting for scan response")
+
+        finally:
+            self._page.remove_listener("response", on_response)
+
+        status = response_holder["status"]
+        body = response_holder["body"]
 
         if status == 429:
             raise RuntimeError("rate_limited (429)")
@@ -261,14 +306,14 @@ def _load_proxies(proxy_file: str) -> list:
 class CopyleaksRewardPool:
     """
     Manages N browser workers. Each keeps a persistent page open and
-    calls the Copyleaks API via in-browser fetch().
+    drives the Copyleaks UI to score texts (Turnstile-safe).
     """
 
     def __init__(
         self,
         num_workers: int = 2,
         rate_limit: float = 4.0,
-        timeout: float = 30.0,
+        timeout: float = 60.0,
         max_retries: int = 3,
         mock_mode: bool = False,
         headless: bool = True,
