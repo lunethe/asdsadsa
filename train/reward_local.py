@@ -15,7 +15,9 @@ from typing import List, Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "Hello-SimpleAI/chatgpt-detector-roberta"
+# RAID benchmark #1 (Jan 2025) — DeBERTa-v3-Large trained on diverse modern LLMs
+# (GPT-4, Claude, Gemini, Llama, Mistral etc.). Safetensors format, no torch version issues.
+MODEL_ID = "desklib/ai-text-detector-v1.01"
 MIN_CHARS = 100
 MAX_CHARS = 10000
 
@@ -58,7 +60,6 @@ class LocalDetectorWorker:
         self._pipe = pipeline(
             "text-classification",
             model=MODEL_ID,
-            revision="refs/pr/2",   # safetensors branch (avoids torch.load CVE)
             device=device_idx,
             truncation=True,
             max_length=512,
@@ -86,9 +87,9 @@ class LocalDetectorWorker:
             # Model returns [{"label": "ChatGPT"/"Human", "score": 0.xx}]
             label = result[0]["label"].lower()
             score = float(result[0]["score"])
-            # "ChatGPT" or "AI" label → ai_probability = score
-            # "Human" label → ai_probability = 1 - score
-            if "human" in label:
+            # Labels vary by model: "ai"/"fake"/"generated" → ai_prob = score
+            # "human"/"real" → ai_prob = 1 - score
+            if any(w in label for w in ("human", "real", "original")):
                 ai_prob = 1.0 - score
             else:
                 ai_prob = score
