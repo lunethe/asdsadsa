@@ -41,7 +41,7 @@ from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 from .config import Config
 from .data_collector import InfiniteDataLoader, load_all_datasets, TrainingSample
-from .reward_copyleaks import CopyleaksRewardPool, ScoreResult
+from .reward_local import LocalRewardPool, ScoreResult
 
 logger = logging.getLogger(__name__)
 
@@ -429,13 +429,8 @@ class GRPOTrainer:
 
         # ── Reward pool ───────────────────────────────────────────────────
         async def run_training():
-            async with CopyleaksRewardPool(
-                num_workers=cfg.copyleaks.num_workers,
-                rate_limit=cfg.copyleaks.rate_limit_seconds,
-                timeout=cfg.copyleaks.timeout_seconds,
-                max_retries=cfg.copyleaks.max_retries,
+            async with LocalRewardPool(
                 mock_mode=cfg.copyleaks.mock_mode,
-                proxy_file=cfg.copyleaks.proxy_file or None,
             ) as reward_pool:
                 await _training_loop(
                     cfg, model, tokenizer, dataloader, optimizer, scheduler,
@@ -456,7 +451,7 @@ async def _training_loop(
     dataloader: InfiniteDataLoader,
     optimizer,
     scheduler,
-    reward_pool: CopyleaksRewardPool,
+    reward_pool: LocalRewardPool,
     log_fn,
     save_fn,
 ):
