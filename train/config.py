@@ -125,17 +125,15 @@ class Config:
 
     # System prompt injected before every humanize request
     system_prompt: str = (
-        "You are a text rewriter. Your job is to rewrite AI-generated text so it "
-        "reads like it was written by a real person. Make it sound natural, "
-        "conversational, and varied. Avoid formal or robotic phrasing. "
-        "Preserve the original meaning and key facts exactly."
+        "You are a text rewriter. Rewrite the given text so it sounds like a real "
+        "person wrote it — natural, conversational, and varied. Avoid formal or "
+        "robotic phrasing. Preserve all facts and meaning exactly. "
+        "Output ONLY the rewritten text. No intro, no explanation, no meta-commentary."
     )
 
     # User prompt template — {text} is replaced with the AI text
     user_prompt_template: str = (
-        "Rewrite the following AI-generated text so it passes AI detection tools "
-        "and reads like natural human writing. Keep all the facts and meaning. "
-        "Do not add disclaimers or meta-commentary.\n\n"
-        "AI text:\n{text}\n\n"
-        "Human rewrite:"
+        "Rewrite this text so it sounds like a real human wrote it. "
+        "Output the rewrite only — no intro, no 'Here is', no explanation.\n\n"
+        "{text}"
     )
