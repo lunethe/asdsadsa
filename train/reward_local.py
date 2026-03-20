@@ -58,6 +58,7 @@ class LocalDetectorWorker:
         self._pipe = pipeline(
             "text-classification",
             model=MODEL_ID,
+            revision="refs/pr/2",   # safetensors branch (avoids torch.load CVE)
             device=device_idx,
             truncation=True,
             max_length=512,
