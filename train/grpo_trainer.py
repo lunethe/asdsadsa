@@ -41,7 +41,8 @@ from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 from .config import Config
 from .data_collector import InfiniteDataLoader, load_all_datasets, TrainingSample
-from .reward_gptzero import GPTZeroRewardPool, ScoreResult
+from .reward_local import LocalRewardPool, ScoreResult
+from .reward_gptzero import GPTZeroRewardPool
 
 logger = logging.getLogger(__name__)
 
@@ -429,10 +430,8 @@ class GRPOTrainer:
 
         # ── Reward pool ───────────────────────────────────────────────────
         async def run_training():
-            async with GPTZeroRewardPool(
+            async with LocalRewardPool(
                 mock_mode=cfg.copyleaks.mock_mode,
-                num_workers=cfg.copyleaks.num_workers,
-                rate_limit=float(os.getenv("GPTZERO_RATE_LIMIT", "0.5")),
             ) as reward_pool:
                 await _training_loop(
                     cfg, model, tokenizer, dataloader, optimizer, scheduler,
@@ -453,7 +452,7 @@ async def _training_loop(
     dataloader: InfiniteDataLoader,
     optimizer,
     scheduler,
-    reward_pool: GPTZeroRewardPool,
+    reward_pool: LocalRewardPool,
     log_fn,
     save_fn,
 ):
@@ -556,9 +555,19 @@ async def _training_loop(
             logger.info(f"Best completion (reward={rewards[best_idx]:.3f}): {best_text!r}")
             log_fn(metrics, step)
 
-        # ── 8. Checkpoint ─────────────────────────────────────────────────
+        # ── 8. Checkpoint + GPTZero eval ──────────────────────────────────
         if step % cfg.training.save_every == 0:
             save_fn(model, tokenizer, step)
+            gptzero_key = os.getenv("GPTZERO_API_KEY", "")
+            if gptzero_key and best_text:
+                try:
+                    async with GPTZeroRewardPool(num_workers=1, api_key=gptzero_key) as gz:
+                        gz_score = await gz._workers[0].score(best_text)
+                    log_fn({"gptzero/ai_prob": gz_score.ai_probability,
+                            "gptzero/reward": gz_score.reward}, step)
+                    logger.info(f"[GPTZero eval] step={step} AI={gz_score.ai_probability:.2%}")
+                except Exception as e:
+                    logger.warning(f"GPTZero eval failed: {e}")
 
     # Final checkpoint
     save_fn(model, tokenizer, step)
