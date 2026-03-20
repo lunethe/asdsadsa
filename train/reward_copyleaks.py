@@ -94,10 +94,26 @@ async def _solve_turnstile(client: httpx.AsyncClient, api_key: str) -> str:
     raise RuntimeError("CapSolver timed out waiting for Turnstile solution")
 
 
+def _load_proxies(proxy_file: str) -> List[str]:
+    if not proxy_file or not os.path.exists(proxy_file):
+        return []
+    proxies = []
+    with open(proxy_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not line.startswith("http"):
+                line = f"http://{line}"
+            proxies.append(line)
+    return proxies
+
+
 class CopyleaksWorker:
     """
     Scores texts via Copyleaks anonymous AI detector.
     Uses CapSolver to solve Turnstile on each request.
+    Routes Copyleaks requests through a proxy if provided.
     """
 
     def __init__(
@@ -107,12 +123,14 @@ class CopyleaksWorker:
         rate_limit: float = DEFAULT_RATE_LIMIT,
         max_retries: int = 3,
         timeout: float = 60.0,
+        proxy: Optional[str] = None,
     ):
         self.worker_id = worker_id
         self.api_key = api_key or os.getenv("CAPSOLVER_API_KEY", "")
         self.rate_limit = rate_limit
         self.max_retries = max_retries
         self.timeout = timeout
+        self.proxy = proxy
         self._client: Optional[httpx.AsyncClient] = None
         self._last_request_at = 0.0
 
@@ -133,9 +151,11 @@ class CopyleaksWorker:
                 "Origin": "https://app.copyleaks.com",
                 "Referer": "https://app.copyleaks.com/v1/scan/ai/embedded",
             },
+            proxies=self.proxy,
             timeout=self.timeout,
         )
-        logger.info(f"[Copyleaks Worker {self.worker_id}] Ready")
+        logger.info(f"[Copyleaks Worker {self.worker_id}] Ready"
+                    + (f" via proxy {self.proxy}" if self.proxy else ""))
 
     async def stop(self):
         if self._client:
@@ -231,12 +251,16 @@ class CopyleaksRewardPool:
         max_retries: int = 3,
         mock_mode: bool = False,
         api_key: Optional[str] = None,
+        proxy_file: Optional[str] = None,
         **kwargs,
     ):
         self.mock_mode = mock_mode
         if mock_mode:
             self._workers = [MockRewardWorker(i) for i in range(num_workers)]
         else:
+            proxies = _load_proxies(proxy_file or os.getenv("PROXY_FILE", ""))
+            if proxies:
+                logger.info(f"Loaded {len(proxies)} proxies for {num_workers} workers")
             self._workers = [
                 CopyleaksWorker(
                     worker_id=i,
@@ -244,6 +268,7 @@ class CopyleaksRewardPool:
                     rate_limit=rate_limit,
                     timeout=timeout,
                     max_retries=max_retries,
+                    proxy=proxies[i % len(proxies)] if proxies else None,
                 )
                 for i in range(num_workers)
             ]
