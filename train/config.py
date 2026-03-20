@@ -103,9 +103,8 @@ class CopyleaksConfig:
     # Seconds between Copyleaks requests (respect rate limit)
     rate_limit_seconds: float = float(os.getenv("RATE_LIMIT", "4.0"))
     # Number of parallel Playwright browser instances
-    num_workers: int = int(os.getenv("CL_WORKERS", "4"))
-    # Max retries per text (high because proxy rotation handles 429s)
-    max_retries: int = 10
+    num_workers: int = int(os.getenv("CL_WORKERS", "8"))
+    max_retries: int = 3
     # Request timeout in seconds
     timeout_seconds: float = 45.0
     # Path to proxy list file (one proxy per line, e.g. http://user:pass@host:port)

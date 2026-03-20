@@ -18,6 +18,9 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 
+# Suppress noisy httpx request logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -134,7 +137,7 @@ class CopyleaksWorker:
         worker_id: int = 0,
         api_key: Optional[str] = None,
         rate_limit: float = DEFAULT_RATE_LIMIT,
-        max_retries: int = 10,
+        max_retries: int = 3,
         timeout: float = 60.0,
         proxies: Optional[List[str]] = None,
     ):
@@ -199,7 +202,6 @@ class CopyleaksWorker:
             try:
                 await self._wait_rate_limit()
 
-                # Solve Turnstile (via direct connection, not proxy)
                 token = await _solve_turnstile(self._capsolver_client, self.api_key)
 
                 resp = await self._client.post(
@@ -207,16 +209,15 @@ class CopyleaksWorker:
                     json={"text": text, "captchaResponse": token, "acdiToken": None},
                 )
 
-                if resp.status_code == 429:
-                    # Rotate proxy immediately and retry — no sleeping
-                    logger.warning(f"[Worker {self.worker_id}] 429 on proxy {self._current_proxy()}, rotating")
+                if resp.status_code == 429 or (resp.status_code in (403, 503) and
+                        any(w in resp.text for w in ("cloudflare", "banned", "blocked", "ray id"))):
+                    logger.warning(f"[Worker {self.worker_id}] {resp.status_code} — rotating proxy")
                     self._rotate_proxy()
                     await self._client.aclose()
                     self._client = await self._make_client()
                     continue
 
                 if resp.status_code == 400 and "too-short" in resp.text:
-                    logger.warning(f"[Worker {self.worker_id}] Text too short for Copyleaks, skipping")
                     return ScoreResult(text_preview=preview, ai_probability=0.5, reward=0.5,
                                        raw={"error": "too_short"}, error="too_short")
 
@@ -264,10 +265,10 @@ class CopyleaksRewardPool:
 
     def __init__(
         self,
-        num_workers: int = 4,
+        num_workers: int = 8,
         rate_limit: float = DEFAULT_RATE_LIMIT,
         timeout: float = 60.0,
-        max_retries: int = 10,
+        max_retries: int = 3,
         mock_mode: bool = False,
         api_key: Optional[str] = None,
         proxy_file: Optional[str] = None,
