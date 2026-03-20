@@ -1,11 +1,10 @@
 """
 Local AI-Detection Reward Function
 ====================================
-Uses a frozen DeBERTa-v3-Large classifier (desklib/ai-text-detector-v1.01)
+Uses a frozen RoBERTa-Large classifier (Hello-SimpleAI/chatgpt-detector-roberta)
 to score text. Runs on the same GPU as training — no network, no captcha.
 
-RAID benchmark #1 (Jan 2025) — trained on GPT-4, Claude, Gemini, Llama, Mistral etc.
-
+Labels: "Human" → reward=score, "ChatGPT" → reward=1-score
 Reward = P(human)  (1.0 = fully human, 0.0 = fully AI)
 """
 
@@ -17,9 +16,10 @@ from typing import List, Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-# RAID benchmark #1 (Jan 2025) — DeBERTa-v3-Large trained on diverse modern LLMs.
-# Checkpoint uses "model.*" key prefix and num_labels=1 (sigmoid) — loaded manually below.
-MODEL_ID = "desklib/ai-text-detector-v1.01"
+# RoBERTa-Large fine-tuned on HC3 (human vs ChatGPT).
+# Use refs/pr/2 for the safetensors branch (avoids torch CVE-2025-32434 on .bin).
+MODEL_ID = "Hello-SimpleAI/chatgpt-detector-roberta"
+MODEL_REVISION = "refs/pr/2"
 MIN_CHARS = 100
 MAX_CHARS = 10000
 
@@ -54,72 +54,27 @@ class LocalDetectorWorker:
         self._pipe = None
 
     def start_sync(self):
+        from transformers import pipeline
         import torch
-        import torch.nn as nn
-        import safetensors.torch
-        from huggingface_hub import hf_hub_download
-        from transformers import AutoTokenizer, AutoConfig, DebertaV2Model, DebertaV2PreTrainedModel
 
         device_idx = 0 if (self.device == "auto" and torch.cuda.is_available()) else -1
         logger.info(f"[Detector] Loading {MODEL_ID} on device={device_idx}")
-
-        # desklib checkpoint: encoder stored under "model.*", classifier at top level,
-        # NO pooler — classifies directly from [CLS] hidden state via Linear(1024, 1).
-        class _DesklibDetector(DebertaV2PreTrainedModel):
-            def __init__(self, cfg):
-                super().__init__(cfg)
-                self.deberta = DebertaV2Model(cfg)
-                self.classifier = nn.Linear(cfg.hidden_size, 1)
-                self.post_init()
-
-            def forward(self, input_ids=None, attention_mask=None, **kwargs):
-                out = self.deberta(input_ids, attention_mask=attention_mask)
-                cls = out.last_hidden_state[:, 0, :]  # [CLS] token, shape (batch, 1024)
-                return self.classifier(cls)            # (batch, 1)
-
-        config = AutoConfig.from_pretrained(MODEL_ID)
-        model = _DesklibDetector(config)
-
-        # Remap "model.*" → "deberta.*"; classifier.* stays as-is
-        ckpt_path = hf_hub_download(MODEL_ID, "model.safetensors")
-        raw_sd = safetensors.torch.load_file(ckpt_path)
-        remapped = {
-            ("deberta." + k[len("model."):] if k.startswith("model.") else k): v
-            for k, v in raw_sd.items()
-        }
-        missing, unexpected = model.load_state_dict(remapped, strict=False)
-        if missing:
-            logger.warning(f"[Detector] Missing keys: {missing[:5]}")
-        if unexpected:
-            logger.warning(f"[Detector] Unexpected keys: {unexpected[:5]}")
-
-        if device_idx >= 0:
-            model = model.cuda(device_idx)
-        model.eval()
-
-        self._model = model
-        self._tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-        self._device_idx = device_idx
-        self._torch = torch
-        logger.info(f"[Detector] Model loaded")
-
-    def _infer(self, text: str) -> float:
-        """Synchronous inference. Returns sigmoid score (higher = more AI)."""
-        inputs = self._tokenizer(
-            text, return_tensors="pt", truncation=True, max_length=512
+        self._pipe = pipeline(
+            "text-classification",
+            model=MODEL_ID,
+            revision=MODEL_REVISION,
+            device=device_idx,
+            truncation=True,
+            max_length=512,
         )
-        if self._device_idx >= 0:
-            inputs = {k: v.cuda(self._device_idx) for k, v in inputs.items()}
-        with self._torch.no_grad():
-            logit = self._model(**inputs)          # (1, 1)
-        return float(self._torch.sigmoid(logit[0, 0]).cpu())
+        logger.info(f"[Detector] Model loaded")
 
     async def start(self):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self.start_sync)
 
     async def stop(self):
-        self._model = None
+        self._pipe = None
 
     async def score(self, text: str) -> ScoreResult:
         text = _prepare_text(text)
@@ -131,13 +86,19 @@ class LocalDetectorWorker:
 
         loop = asyncio.get_event_loop()
         try:
-            # sigmoid output: higher = more AI-like
-            ai_prob = await loop.run_in_executor(None, self._infer, text)
+            result = await loop.run_in_executor(None, self._pipe, text)
+            label = result[0]["label"].lower()
+            score = float(result[0]["score"])
+            # Labels: "human" → score = P(human), "chatgpt" → score = P(AI)
+            if any(w in label for w in ("human", "real", "original")):
+                ai_prob = 1.0 - score
+            else:
+                ai_prob = score
             ai_prob = max(0.0, min(1.0, ai_prob))
             reward = 1.0 - ai_prob
             logger.info(f"[Detector] AI={ai_prob:.2%} reward={reward:.3f} | {preview!r}")
             return ScoreResult(text_preview=preview, ai_probability=ai_prob,
-                               reward=reward, raw={"sigmoid": ai_prob})
+                               reward=reward, raw={"label": label, "score": score})
         except Exception as e:
             logger.error(f"[Detector] Inference failed: {e}")
             return ScoreResult(text_preview=preview, ai_probability=0.5, reward=0.5,
