@@ -29,7 +29,7 @@ TURNSTILE_PAGE_URL = "https://app.copyleaks.com/v1/scan/ai/embedded"
 
 MIN_CHARS = 150
 MAX_CHARS = 25000
-DEFAULT_RATE_LIMIT = 4.0   # seconds between requests per worker
+DEFAULT_RATE_LIMIT = 1.0   # seconds between requests (proxy rotation handles rate limits)
 
 
 @dataclass
@@ -109,11 +109,24 @@ def _load_proxies(proxy_file: str) -> List[str]:
     return proxies
 
 
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/json",
+    "Origin": "https://app.copyleaks.com",
+    "Referer": "https://app.copyleaks.com/v1/scan/ai/embedded",
+}
+
+
 class CopyleaksWorker:
     """
     Scores texts via Copyleaks anonymous AI detector.
-    Uses CapSolver to solve Turnstile on each request.
-    Routes Copyleaks requests through a proxy if provided.
+    On 429, immediately rotates to the next proxy and retries — no sleeping.
     """
 
     def __init__(
@@ -121,51 +134,57 @@ class CopyleaksWorker:
         worker_id: int = 0,
         api_key: Optional[str] = None,
         rate_limit: float = DEFAULT_RATE_LIMIT,
-        max_retries: int = 3,
+        max_retries: int = 10,
         timeout: float = 60.0,
-        proxy: Optional[str] = None,
+        proxies: Optional[List[str]] = None,
     ):
         self.worker_id = worker_id
         self.api_key = api_key or os.getenv("CAPSOLVER_API_KEY", "")
         self.rate_limit = rate_limit
         self.max_retries = max_retries
         self.timeout = timeout
-        self.proxy = proxy
+        self.proxies = proxies or []
+        self._proxy_idx = worker_id % len(self.proxies) if self.proxies else 0
         self._client: Optional[httpx.AsyncClient] = None
+        self._capsolver_client: Optional[httpx.AsyncClient] = None
         self._last_request_at = 0.0
 
         if not self.api_key:
             raise ValueError("CAPSOLVER_API_KEY not set. Export it or pass api_key=")
 
-    async def start(self):
-        self._client = httpx.AsyncClient(
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Content-Type": "application/json",
-                "Origin": "https://app.copyleaks.com",
-                "Referer": "https://app.copyleaks.com/v1/scan/ai/embedded",
-            },
-            proxies=self.proxy,
+    def _current_proxy(self) -> Optional[str]:
+        return self.proxies[self._proxy_idx] if self.proxies else None
+
+    def _rotate_proxy(self):
+        if self.proxies:
+            self._proxy_idx = (self._proxy_idx + 1) % len(self.proxies)
+            logger.info(f"[Worker {self.worker_id}] Rotated to proxy {self._current_proxy()}")
+
+    async def _make_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            headers=_HEADERS,
+            proxies=self._current_proxy(),
             timeout=self.timeout,
         )
+
+    async def start(self):
+        self._client = await self._make_client()
+        # CapSolver calls go direct (no proxy needed)
+        self._capsolver_client = httpx.AsyncClient(timeout=30.0)
         logger.info(f"[Copyleaks Worker {self.worker_id}] Ready"
-                    + (f" via proxy {self.proxy}" if self.proxy else ""))
+                    + (f" via {self._current_proxy()}" if self.proxies else ""))
 
     async def stop(self):
         if self._client:
             await self._client.aclose()
+        if self._capsolver_client:
+            await self._capsolver_client.aclose()
 
     async def _wait_rate_limit(self):
         elapsed = time.monotonic() - self._last_request_at
         wait = self.rate_limit - elapsed
         if wait > 0:
-            await asyncio.sleep(wait + random.uniform(0.2, 1.0))
+            await asyncio.sleep(wait)
         self._last_request_at = time.monotonic()
 
     async def score(self, text: str) -> ScoreResult:
@@ -180,22 +199,20 @@ class CopyleaksWorker:
             try:
                 await self._wait_rate_limit()
 
-                # Solve Turnstile fresh for each request
-                token = await _solve_turnstile(self._client, self.api_key)
+                # Solve Turnstile (via direct connection, not proxy)
+                token = await _solve_turnstile(self._capsolver_client, self.api_key)
 
                 resp = await self._client.post(
                     COPYLEAKS_SCAN_URL,
-                    json={
-                        "text": text,
-                        "captchaResponse": token,
-                        "acdiToken": None,
-                    },
+                    json={"text": text, "captchaResponse": token, "acdiToken": None},
                 )
 
                 if resp.status_code == 429:
-                    wait = int(resp.headers.get("Retry-After", 60))
-                    logger.warning(f"[Copyleaks Worker {self.worker_id}] Rate limited, sleeping {wait}s")
-                    await asyncio.sleep(wait)
+                    # Rotate proxy immediately and retry — no sleeping
+                    logger.warning(f"[Worker {self.worker_id}] 429 on proxy {self._current_proxy()}, rotating")
+                    self._rotate_proxy()
+                    await self._client.aclose()
+                    self._client = await self._make_client()
                     continue
 
                 if resp.status_code != 200:
@@ -207,20 +224,14 @@ class CopyleaksWorker:
                 ai_prob = max(0.0, min(1.0, ai_prob))
                 reward = 1.0 - ai_prob
 
-                logger.info(
-                    f"[Copyleaks Worker {self.worker_id}] AI={ai_prob:.2%} "
-                    f"reward={reward:.3f} | {preview!r}"
-                )
+                logger.info(f"[Worker {self.worker_id}] AI={ai_prob:.2%} reward={reward:.3f} | {preview!r}")
                 return ScoreResult(text_preview=preview, ai_probability=ai_prob,
                                    reward=reward, raw=data)
 
             except Exception as e:
-                logger.warning(
-                    f"[Copyleaks Worker {self.worker_id}] Attempt {attempt+1}/"
-                    f"{self.max_retries} failed: {e}"
-                )
+                logger.warning(f"[Worker {self.worker_id}] Attempt {attempt+1}/{self.max_retries} failed: {e}")
                 if attempt < self.max_retries - 1:
-                    await asyncio.sleep(5.0 * (attempt + 1))
+                    await asyncio.sleep(2.0)
 
         return ScoreResult(text_preview=preview, ai_probability=0.5, reward=0.5,
                            raw={"error": "all_retries_failed"}, error="all_retries_failed")
@@ -241,14 +252,17 @@ class MockRewardWorker:
 
 
 class CopyleaksRewardPool:
-    """Pool of workers. Each worker solves its own Turnstile per request."""
+    """
+    Pool of workers. Each worker gets the full proxy list and rotates
+    through them on 429 — no sleeping, just switch proxy and retry.
+    """
 
     def __init__(
         self,
-        num_workers: int = 2,
+        num_workers: int = 4,
         rate_limit: float = DEFAULT_RATE_LIMIT,
         timeout: float = 60.0,
-        max_retries: int = 3,
+        max_retries: int = 10,
         mock_mode: bool = False,
         api_key: Optional[str] = None,
         proxy_file: Optional[str] = None,
@@ -260,7 +274,9 @@ class CopyleaksRewardPool:
         else:
             proxies = _load_proxies(proxy_file or os.getenv("PROXY_FILE", ""))
             if proxies:
-                logger.info(f"Loaded {len(proxies)} proxies for {num_workers} workers")
+                logger.info(f"Loaded {len(proxies)} proxies, {num_workers} workers")
+            else:
+                logger.warning("No proxies loaded — rate limits will hit fast")
             self._workers = [
                 CopyleaksWorker(
                     worker_id=i,
@@ -268,7 +284,7 @@ class CopyleaksRewardPool:
                     rate_limit=rate_limit,
                     timeout=timeout,
                     max_retries=max_retries,
-                    proxy=proxies[i % len(proxies)] if proxies else None,
+                    proxies=proxies,
                 )
                 for i in range(num_workers)
             ]
