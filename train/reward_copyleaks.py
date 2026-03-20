@@ -143,47 +143,55 @@ class CopyleaksWorker:
 
     async def _fill_editor(self, text: str):
         """Type text into the Angular scan editor."""
-        # Click a chip first — chips are always enabled and clicking one
-        # focuses the editor component reliably.
+        # Click a chip to populate editor (chip buttons are always clickable)
         chip = await self._page.query_selector(
-            "mat-chip-option, .mdc-evolution-chip__action"
+            "mat-chip-option .mdc-evolution-chip__action"
         )
         if chip:
             await chip.click()
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1.0)
 
-        # Select all content (chip text) and replace with our text
-        await self._page.keyboard.press("Control+a")
-        await asyncio.sleep(0.1)
-
-        # Set clipboard content via JS, then paste — avoids slow key-by-key typing
+        # Check what Angular component holds the text by finding the PT key in localStorage
+        # PT stores the editor text (base64 encoded). We can set it directly.
         await self._page.evaluate(
             """(txt) => {
-                const dt = new DataTransfer();
-                dt.setData('text/plain', txt);
-                document.dispatchEvent(new ClipboardEvent('paste', {
-                    clipboardData: dt, bubbles: true, cancelable: true
-                }));
+                // Set PT (editor text) in localStorage — Angular reads this
+                localStorage.setItem('PT', btoa(encodeURIComponent(txt)));
+
+                // Also try directly on the editor element
+                const editor = document.querySelector('.scan-text-editor');
+                if (editor) {
+                    // Try setting via nativeElement value setter
+                    const proto = Object.getOwnPropertyDescriptor(
+                        window.HTMLElement.prototype, 'textContent'
+                    );
+                    if (proto && proto.set) {
+                        proto.set.call(editor, txt);
+                    } else {
+                        editor.textContent = txt;
+                    }
+                    editor.dispatchEvent(new InputEvent('input', {bubbles: true}));
+                    editor.dispatchEvent(new Event('change', {bubbles: true}));
+                }
             }""",
             text,
         )
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
 
-        # Fallback: if clipboard paste didn't work, force-set via JS
-        current_len = await self._page.evaluate(
+        # Verify what's in the editor
+        actual_len = await self._page.evaluate(
             "document.querySelector('.scan-text-editor')?.textContent?.length || 0"
         )
-        if current_len < 10:
-            await self._page.evaluate(
-                """(txt) => {
-                    const el = document.querySelector('.scan-text-editor');
-                    if (el) {
-                        el.textContent = txt;
-                        el.dispatchEvent(new InputEvent('input', {bubbles: true, data: txt}));
-                    }
-                }""",
-                text,
-            )
+        logger.info(f"[Worker {self.worker_id}] Editor content length: {actual_len} chars")
+        if actual_len < MIN_CHARS:
+            # Last resort: use page.keyboard.type() — slower but works anywhere
+            logger.warning(f"[Worker {self.worker_id}] Paste failed, falling back to keyboard.type()")
+            editor = await self._page.query_selector(".scan-text-editor")
+            if editor:
+                await editor.click(force=True)
+                await asyncio.sleep(0.3)
+            await self._page.keyboard.press("Control+a")
+            await self._page.keyboard.type(text[:2000], delay=0)  # cap at 2000 chars for speed
             await asyncio.sleep(0.3)
 
     async def score(self, text: str) -> ScoreResult:
@@ -225,14 +233,16 @@ class CopyleaksWorker:
         response_event = asyncio.Event()
 
         async def on_response(response):
+            if "copyleaks.com" in response.url:
+                logger.info(f"[Worker {self.worker_id}] Response: {response.status} {response.url[:80]}")
             if API_URL in response.url and "status" not in response_holder:
                 try:
                     body = await response.text()
                     response_holder["status"] = response.status
                     response_holder["body"] = body
                     response_event.set()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"[Worker {self.worker_id}] Failed to read response body: {e}")
 
         self._page.on("response", on_response)
         try:
