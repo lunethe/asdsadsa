@@ -27,7 +27,7 @@ COPYLEAKS_SCAN_URL = "https://app.copyleaks.com/api/v2/dashboard/anonymous/ai-sc
 TURNSTILE_SITEKEY  = "0x4AAAAAAADZUXiboAFN3tU8"
 TURNSTILE_PAGE_URL = "https://app.copyleaks.com/v1/scan/ai/embedded"
 
-MIN_CHARS = 150
+MIN_CHARS = 350
 MAX_CHARS = 25000
 DEFAULT_RATE_LIMIT = 1.0   # seconds between requests (proxy rotation handles rate limits)
 
@@ -214,6 +214,11 @@ class CopyleaksWorker:
                     await self._client.aclose()
                     self._client = await self._make_client()
                     continue
+
+                if resp.status_code == 400 and "too-short" in resp.text:
+                    logger.warning(f"[Worker {self.worker_id}] Text too short for Copyleaks, skipping")
+                    return ScoreResult(text_preview=preview, ai_probability=0.5, reward=0.5,
+                                       raw={"error": "too_short"}, error="too_short")
 
                 if resp.status_code != 200:
                     raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
