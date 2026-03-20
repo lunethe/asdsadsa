@@ -143,31 +143,48 @@ class CopyleaksWorker:
 
     async def _fill_editor(self, text: str):
         """Type text into the Angular scan editor."""
-        # Click into the editor area to focus it
-        await self._page.click(".scan-text-editor-container")
-        await asyncio.sleep(0.3)
-        # Select all existing content and replace
+        # Click a chip first — chips are always enabled and clicking one
+        # focuses the editor component reliably.
+        chip = await self._page.query_selector(
+            "mat-chip-option, .mdc-evolution-chip__action"
+        )
+        if chip:
+            await chip.click()
+            await asyncio.sleep(0.5)
+
+        # Select all content (chip text) and replace with our text
         await self._page.keyboard.press("Control+a")
         await asyncio.sleep(0.1)
-        # Type text — use clipboard paste for speed on long texts
+
+        # Set clipboard content via JS, then paste — avoids slow key-by-key typing
         await self._page.evaluate(
-            """async (txt) => {
-                try {
-                    await navigator.clipboard.writeText(txt);
-                } catch(e) {
-                    // clipboard may be blocked headless — fall back to input event
-                    const el = document.querySelector('.scan-text-editor');
-                    if (el) {
-                        el.textContent = txt;
-                        el.dispatchEvent(new Event('input', {bubbles: true}));
-                    }
-                }
+            """(txt) => {
+                const dt = new DataTransfer();
+                dt.setData('text/plain', txt);
+                document.dispatchEvent(new ClipboardEvent('paste', {
+                    clipboardData: dt, bubbles: true, cancelable: true
+                }));
             }""",
             text,
         )
-        # Paste via Ctrl+V
-        await self._page.keyboard.press("Control+v")
         await asyncio.sleep(0.3)
+
+        # Fallback: if clipboard paste didn't work, force-set via JS
+        current_len = await self._page.evaluate(
+            "document.querySelector('.scan-text-editor')?.textContent?.length || 0"
+        )
+        if current_len < 10:
+            await self._page.evaluate(
+                """(txt) => {
+                    const el = document.querySelector('.scan-text-editor');
+                    if (el) {
+                        el.textContent = txt;
+                        el.dispatchEvent(new InputEvent('input', {bubbles: true, data: txt}));
+                    }
+                }""",
+                text,
+            )
+            await asyncio.sleep(0.3)
 
     async def score(self, text: str) -> ScoreResult:
         text = _prepare_text(text)
