@@ -73,13 +73,20 @@ class LocalDetectorWorker:
         config.num_labels = 1
         model = DebertaV2ForSequenceClassification(config)
 
-        # Checkpoint keys use "model.*" prefix; HF expects "deberta.*" — remap them
+        # Checkpoint keys use "model.*" prefix. Only the base model sub-keys
+        # (embeddings, encoder, rel_embeddings) map to "deberta.*".
+        # Top-level heads (classifier, pooler) just strip the "model." prefix.
+        _DEBERTA_SUBKEYS = ("embeddings.", "encoder.", "rel_embeddings.")
         ckpt_path = hf_hub_download(MODEL_ID, "model.safetensors")
         raw_sd = safetensors.torch.load_file(ckpt_path)
         remapped = {}
         for k, v in raw_sd.items():
             if k.startswith("model."):
-                remapped["deberta." + k[len("model."):]] = v
+                rest = k[len("model."):]
+                if any(rest.startswith(s) for s in _DEBERTA_SUBKEYS):
+                    remapped["deberta." + rest] = v
+                else:
+                    remapped[rest] = v
             else:
                 remapped[k] = v
         missing, unexpected = model.load_state_dict(remapped, strict=False)
