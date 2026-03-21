@@ -302,16 +302,43 @@ class CopyleaksRewardPool:
     async def __aexit__(self, *args):
         await asyncio.gather(*[w.stop() for w in self._workers])
 
+    async def _restart_worker(self, idx: int):
+        """Restart a dead worker in-place."""
+        try:
+            await self._workers[idx].stop()
+        except Exception:
+            pass
+        w = self._workers[idx]
+        fresh = CopyleaksWorker(
+            worker_id=w.worker_id,
+            api_key=w.api_key,
+            rate_limit=w.rate_limit,
+            max_retries=w.max_retries,
+            timeout=w.timeout,
+            proxies=w.proxies,
+        )
+        await fresh.start()
+        self._workers[idx] = fresh
+        logger.info(f"[Pool] Worker {idx} restarted")
+
     async def score_batch(self, texts: List[str]) -> List[ScoreResult]:
         assignments = [[] for _ in self._workers]
         for i, text in enumerate(texts):
             assignments[i % len(self._workers)].append(text)
 
-        async def worker_task(worker, worker_texts):
-            return [await worker.score(t) for t in worker_texts]
+        async def worker_task(idx, worker_texts):
+            results = []
+            for t in worker_texts:
+                r = await self._workers[idx].score(t)
+                if r.error == "all_retries_failed":
+                    logger.warning(f"[Pool] Worker {idx} failed, restarting...")
+                    await self._restart_worker(idx)
+                    r = await self._workers[idx].score(t)
+                results.append(r)
+            return results
 
         worker_results = await asyncio.gather(*[
-            worker_task(w, assignments[i]) for i, w in enumerate(self._workers)
+            worker_task(i, assignments[i]) for i in range(len(self._workers))
         ])
 
         ordered = [None] * len(texts)
