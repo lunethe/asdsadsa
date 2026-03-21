@@ -58,8 +58,11 @@ for i, text in enumerate(SAMPLES, 1):
         {"role": "user",   "content": USER_TEMPLATE.format(text=text)},
     ]
     inputs = tokenizer.apply_chat_template(
-        messages, return_tensors="pt", add_generation_prompt=True
-    ).to(model.device)
+        messages, return_tensors="pt", add_generation_prompt=True, tokenize=True
+    )
+    if isinstance(inputs, dict):
+        inputs = inputs["input_ids"]
+    inputs = inputs.to(model.device)
 
     with torch.no_grad():
         out = model.generate(
