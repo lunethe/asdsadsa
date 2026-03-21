@@ -522,6 +522,15 @@ async def _training_loop(
 
         score_results: List[ScoreResult] = await reward_pool.score_batch(scored_texts)
         rewards_list = [r.reward for r in score_results]
+
+        # Penalize cheating: underscore-apostrophes and zero-width characters
+        import re as _re
+        _zwc = re.compile(r"[\u200B\u200C\u200D\uFEFF\u00AD]")
+        _underscore_apos = re.compile(r"\w_\w")
+        for i, text in enumerate(flat_completions):
+            if _underscore_apos.search(text) or _zwc.search(text):
+                rewards_list[i] = min(rewards_list[i], 0.0)
+
         rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)
 
         # ── 6. GRPO policy update ─────────────────────────────────────────
