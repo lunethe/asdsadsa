@@ -4,7 +4,6 @@ Extracted here so training code can import it without triggering model loading.
 """
 
 import re
-import random
 
 import nltk
 from nltk.tokenize import sent_tokenize
@@ -151,13 +150,11 @@ def post_process(text: str) -> str:
     r = re.sub(r"\s{2,}", " ", r)
     r = r.replace(",.", ".").replace("..", ".")
 
-    words = r.split(" ")
-    zwc = ["\u200B", "\u200C", "\u200D", "\uFEFF"]
-    for i in range(len(words)):
-        if random.random() < 0.04 and len(words[i]) > 4:
-            pos = 1 + random.randint(0, len(words[i]) - 3)
-            c = random.choice(zwc)
-            words[i] = words[i][:pos] + c + words[i][pos:]
-    r = " ".join(words)
+    # Strip any zero-width / invisible characters the model may have inserted
+    for zwc in ("\u200B", "\u200C", "\u200D", "\uFEFF", "\u00AD"):
+        r = r.replace(zwc, "")
+
+    # Fix underscore-apostrophes (e.g. aren_t → aren't, it_s → it's)
+    r = re.sub(r"(\w)_(\w)", lambda m: m.group(1) + "'" + m.group(2), r)
 
     return r.strip()
