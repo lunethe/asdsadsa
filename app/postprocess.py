@@ -154,7 +154,5 @@ def post_process(text: str) -> str:
     for zwc in ("\u200B", "\u200C", "\u200D", "\uFEFF", "\u00AD"):
         r = r.replace(zwc, "")
 
-    # Fix underscore-apostrophes (e.g. aren_t → aren't, it_s → it's)
-    r = re.sub(r"(\w)_(\w)", lambda m: m.group(1) + "'" + m.group(2), r)
 
     return r.strip()
