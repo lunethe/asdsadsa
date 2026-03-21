@@ -397,13 +397,21 @@ class GRPOTrainer:
         # ── Load model ────────────────────────────────────────────────────
         model, tokenizer = load_model_and_tokenizer(cfg)
 
-        # Optionally resume
+        # Optionally resume — reload base model without LoRA, then load checkpoint
         if cfg.training.resume_from:
             logger.info(f"Resuming from {cfg.training.resume_from}")
-            model = PeftModel.from_pretrained(
-                model.base_model.model if hasattr(model, "base_model") else model,
-                cfg.training.resume_from,
+            dtype = getattr(torch, cfg.model.torch_dtype)
+            base = AutoModelForCausalLM.from_pretrained(
+                cfg.model.model_name,
+                torch_dtype=dtype,
+                device_map="auto",
+                trust_remote_code=True,
+                attn_implementation="flash_attention_2" if cfg.model.use_flash_attention else "eager",
             )
+            base.config.use_cache = False
+            model = PeftModel.from_pretrained(base, cfg.training.resume_from, is_trainable=True)
+            model.gradient_checkpointing_enable()
+            model.print_trainable_parameters()
 
         # ── Optimizer and scheduler ───────────────────────────────────────
         optimizer = AdamW(
